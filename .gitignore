@@ -6,3 +6,8 @@ logs/
 .coverage
 /data
 .vscode/
+outputs/
+*.ckpt
+*.pt
+*.pth
+*.zip

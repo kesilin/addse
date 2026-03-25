@@ -1,0 +1,13 @@
+{
+  "stage2_checkpoint": "./outputs/phase9/nhfae_e1_interact_tune2_snr5_10/ckpt/best.pt",
+  "clean_dir": "./outputs/phase6/controlled_snr_test31/snr_10_15/clean",
+  "noisy_dir": "./outputs/phase6/controlled_snr_test31/snr_10_15/noisy",
+  "out_dir": "./outputs/phase9/nhfae_e2_stage3",
+  "epochs": 1,
+  "lr": 5e-6,
+  "lambda_dce": 1.0,
+  "lambda_cfm": 0.7,
+  "lambda_cycle": 0.2,
+  "lambda_mrstft": 0.2,
+  "device": "cuda"
+}
