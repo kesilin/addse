@@ -1,0 +1,17 @@
+experiment:
+  name: nhfae_e1
+  stage: E1
+
+data:
+  clean_dir: outputs/phase6/controlled_snr_test31/snr_10_15/clean
+  noisy_dir: outputs/phase6/controlled_snr_test31/snr_10_15/noisy
+
+train:
+  epochs: 2
+  lr: 0.0002
+  device: cuda
+
+output:
+  out_dir: outputs/phase9/nhfae_e1_snr10_15
+  keep_only_summary: true
+  summary_csv: outputs/phase6/controlled_runs/summary_overall_all_sets.csv

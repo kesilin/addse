@@ -1,0 +1,113 @@
+name: addse-s-musan-ft
+seed: 42
+fs: 16000
+train_segment_length: 1.0
+val_segment_length: 1.0
+max_dynamic_range: 25.0
+num_workers: 0
+
+# 使用MUSAN合成噪声数据源（132MB）
+train_speech_chunks: data/chunks/edbase_speech/
+train_noise_chunks: data/chunks/musan_noise_raw/
+
+lm:
+  _target_: addse.lightning.ADDSELightningModule
+  nac_cfg: configs/nac.yaml
+  nac_ckpt: logs/nac/checkpoints/last.ckpt
+  model:
+    _target_: addse.models.ADDSERQDiT
+    input_channels: 1024
+    output_channels: 1024
+    num_codebooks: 4
+    hidden_dim: 192
+    num_layers: 12
+    num_heads: 12
+    max_seq_len: 1024
+    conditional: true
+    time_independent: true
+  num_steps: 128
+  block_size: 200
+  optimizer:
+    _target_: torch.optim.AdamW
+    _partial_: true
+    lr: 1.0e-4
+    eps: 1.0e-7
+  debug_sample: [0, 0]
+
+dm:
+  _target_: addse.lightning.DataModule
+  train_dataset:
+    _target_: addse.data.DynamicMixingDataset
+    _partial_: true
+    length: .inf
+    resume: true
+    reset_rngs: false
+    snr_range: [0.0, 10.0]
+    speech_dataset:
+      _target_: addse.data.AudioStreamingDataset
+      input_dir: ${train_speech_chunks}
+      fs: ${fs}
+      segment_length: ${train_segment_length}
+      max_dynamic_range: ${max_dynamic_range}
+    noise_dataset:
+      _target_: addse.data.AudioStreamingDataset
+      input_dir: ${train_noise_chunks}
+      fs: ${fs}
+      segment_length: ${train_segment_length}
+      max_dynamic_range: ${max_dynamic_range}
+  val_dataset:
+    _target_: addse.data.DynamicMixingDataset
+    _partial_: true
+    length: null
+    resume: false
+    reset_rngs: true
+    snr_range: [0.0, 10.0]
+    speech_dataset:
+      _target_: addse.data.AudioStreamingDataset
+      input_dir: ${train_speech_chunks}
+      fs: ${fs}
+      segment_length: ${val_segment_length}
+      max_dynamic_range: ${max_dynamic_range}
+    noise_dataset:
+      _target_: addse.data.AudioStreamingDataset
+      input_dir: ${train_noise_chunks}
+      fs: ${fs}
+      segment_length: ${val_segment_length}
+      max_dynamic_range: ${max_dynamic_range}
+  train_dataloader:
+    _target_: addse.data.AudioStreamingDataLoader
+    batch_size: 8
+    num_workers: ${num_workers}
+    pin_memory: false
+    shuffle_buffer_size: 100
+  val_dataloader:
+    _target_: addse.data.AudioStreamingDataLoader
+    batch_size: 1
+    num_workers: ${num_workers}
+    pin_memory: false
+
+trainer:
+  _target_: lightning.Trainer
+  max_epochs: 10
+  limit_train_batches: 150
+  limit_val_batches: 2
+  num_sanity_val_steps: 0
+  accelerator: gpu
+  devices: 1
+  precision: 16-mixed
+  strategy: auto
+  logger:
+    _target_: lightning.pytorch.loggers.TensorBoardLogger
+    save_dir: logs
+    name: ${name}
+    version: null
+    log_graph: false
+    default_hp_metric: null
+  callbacks:
+    - _target_: lightning.pytorch.callbacks.ModelCheckpoint
+      dirpath: logs/${name}/checkpoints
+      filename: "{epoch:02d}-{val_loss:.2f}"
+      save_last: true
+      save_top_k: 1
+      monitor: val_loss
+      mode: min
