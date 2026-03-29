@@ -1,4 +1,5 @@
 from .addse import ADDSERQDiT as ADDSERQDiT
+from .addse import ADDSERQDiTParallel as ADDSERQDiTParallel
 from .adm import ADM as ADM
 from .bsrnn import BSRNN as BSRNN
 from .convtasnet import ConvTasNet as ConvTasNet

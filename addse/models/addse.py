@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -106,6 +107,207 @@ class ADDSERQDiT(nn.Module):
         x = (self.output_norm(x) * (1 + output_scale) + output_shift) * self.skip_scale
         x = self.output_proj(x).moveaxis(-1, 1)  # (B, C, K, L)
         return x.squeeze(2) if squeeze_output else x
+
+
+class ADDSERQDiTParallel(ADDSERQDiT):
+    """ADDSE RQDiT with lightweight continuous adaptation in parallel.
+
+    The discrete diffusion backbone is unchanged. A continuous branch derived from
+    conditioning embeddings is used as a calibration gate before the backbone:
+
+        x' = x * (1 + alpha * sigmoid(W_g(Adapter(c))))
+
+    This keeps pretrained ADDSE behavior largely intact while enabling
+    low-risk parallel fusion experiments.
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        output_channels: int,
+        num_codebooks: int,
+        hidden_dim: int,
+        num_layers: int,
+        num_heads: int,
+        max_seq_len: int,
+        conditional: bool,
+        time_independent: bool,
+        interaction_alpha: float = 0.1,
+        adapter_hidden: int = 256,
+        use_fusion_norm: bool = False,
+        dynamic_alpha: bool = False,
+        alpha_max: float = 0.08,
+        fusion_mode: str = "mul",
+        use_adain_align: bool = False,
+        use_freq_dynamic_gate: bool = False,
+        gate_kernel_size: int = 3,
+        use_pitch_aware_gate: bool = False,
+        pitch_gain: float = 0.1,
+    ) -> None:
+        super().__init__(
+            input_channels=input_channels,
+            output_channels=output_channels,
+            num_codebooks=num_codebooks,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            max_seq_len=max_seq_len,
+            conditional=conditional,
+            time_independent=time_independent,
+        )
+        self.interaction_alpha = interaction_alpha
+        self.use_fusion_norm = use_fusion_norm
+        self.dynamic_alpha = dynamic_alpha
+        self.alpha_max = alpha_max
+        self.fusion_mode = fusion_mode
+        self.use_adain_align = use_adain_align
+        self.use_freq_dynamic_gate = use_freq_dynamic_gate
+        self.use_pitch_aware_gate = use_pitch_aware_gate
+        self.pitch_gain = pitch_gain
+        # Adapter -> Refiner: 4-layer dilated residual conv "refinery" producing FiLM params
+        # dilation schedule chosen to expand temporal receptive field: [1,2,4,8]
+        self.refiner = nn.Sequential(
+            nn.Conv2d(input_channels, adapter_hidden, kernel_size=(3, 1), padding=(1, 0), dilation=1),
+            nn.SiLU(),
+            nn.Conv2d(adapter_hidden, adapter_hidden, kernel_size=(3, 1), padding=(2, 0), dilation=2),
+            nn.SiLU(),
+            nn.Conv2d(adapter_hidden, adapter_hidden, kernel_size=(3, 1), padding=(4, 0), dilation=4),
+            nn.SiLU(),
+            nn.Conv2d(adapter_hidden, input_channels * 2, kernel_size=1),
+        )
+        # Initialize final refiner conv to zero so adapter starts as identity
+        try:
+            last_conv = self.refiner[-1]
+            if isinstance(last_conv, nn.Conv2d):
+                nn.init.zeros_(last_conv.weight)
+                if last_conv.bias is not None:
+                    nn.init.zeros_(last_conv.bias)
+        except Exception:
+            pass
+        self.gate_proj = nn.Conv2d(input_channels, input_channels, kernel_size=1)
+        self.parallel_proj = nn.Conv2d(input_channels, input_channels, kernel_size=1)
+        self.alpha_proj = nn.Conv2d(input_channels, input_channels, kernel_size=1) if dynamic_alpha else None
+        if use_freq_dynamic_gate:
+            pad_k = max(1, gate_kernel_size) // 2
+            self.freq_gate = nn.Conv2d(
+                input_channels,
+                input_channels,
+                # (K, 1): operate along codebook axis (pseudo-frequency), not time axis.
+                kernel_size=(max(1, gate_kernel_size), 1),
+                padding=(pad_k, 0),
+                groups=input_channels,
+            )
+        else:
+            self.freq_gate = None
+
+        if self.fusion_mode not in ("mul", "add"):
+            raise ValueError(f"Unsupported fusion_mode={fusion_mode}. Use 'mul' or 'add'.")
+
+        if use_fusion_norm:
+            self.x_norm = nn.LayerNorm(input_channels)
+            self.c_norm = nn.LayerNorm(input_channels)
+            # Learnable channel-wise scale, initialized close to interaction_alpha.
+            self.gamma = nn.Parameter(torch.full((1, input_channels, 1, 1), interaction_alpha))
+        else:
+            self.x_norm = None
+            self.c_norm = None
+            self.gamma = None
+
+    def _to_4d(self, x: Tensor) -> tuple[Tensor, bool]:
+        if x.ndim == 3:
+            return x[:, :, None, :], True
+        if x.ndim == 4:
+            return x, False
+        raise ValueError(f"Input must be 3D/4D. Got shape {x.shape}.")
+
+    def _apply_channel_norm(self, x: Tensor, ln: nn.LayerNorm | None) -> Tensor:
+        if ln is None:
+            return x
+        x_n = x.moveaxis(1, -1)  # (B, K, L, C)
+        x_n = ln(x_n)
+        return x_n.moveaxis(-1, 1)  # (B, C, K, L)
+
+    def _adain_align(self, src: Tensor, ref: Tensor, eps: float = 1e-5) -> Tensor:
+        # AdaIN over (K, L) dimensions for each (B, C).
+        src_mean = src.mean(dim=(2, 3), keepdim=True)
+        src_std = src.std(dim=(2, 3), keepdim=True).clamp_min(eps)
+        ref_mean = ref.mean(dim=(2, 3), keepdim=True)
+        ref_std = ref.std(dim=(2, 3), keepdim=True).clamp_min(eps)
+        src_norm = (src - src_mean) / src_std
+        return src_norm * ref_std + ref_mean
+
+    def _pitch_proxy(self, c_4d: Tensor) -> Tensor:
+        # Energy-variance proxy: compute per-frame variance across channel dim
+        # (lower variance -> voiced/tonal; higher variance -> noisy).
+        # Input `c_4d` shape: (B, C, K, L). We average over codebook axis K,
+        # compute variance across channels, smooth and return shape (B,1,1,L).
+        # Output shape: (B, 1, 1, L), broadcastable to gate logits.
+        # average over codebooks to reduce quantizer artifacts
+        z = c_4d.mean(dim=2)  # (B, C, L)
+        # variance across channels
+        var = z.var(dim=1, unbiased=False)  # (B, L)
+        # normalize per-sample
+        var = var - var.mean(dim=-1, keepdim=True)
+        denom = (var.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
+        if denom.abs().min() == 0:
+            return torch.zeros(z.shape[0], 1, 1, z.shape[-1], device=z.device, dtype=z.dtype)
+        rho = var / denom
+        rho = rho.unsqueeze(1)  # (B,1,L)
+        rho = F.avg_pool1d(rho, kernel_size=9, stride=1, padding=4)
+        rho = torch.relu(rho)
+        return rho[:, :, None, :]
+
+    def forward(self, x: Tensor, c: Tensor | None = None, t: Tensor | None = None) -> Tensor:
+        x_4d, squeezed = self._to_4d(x)
+        if c is not None:
+            c_4d, _ = self._to_4d(c)
+            x_in = self._apply_channel_norm(x_4d, self.x_norm)
+            c_in = self._apply_channel_norm(c_4d, self.c_norm)
+            # refine conditioning to produce FiLM parameters (gamma, beta)
+            h_ref = self.refiner(c_in)  # (B, 2*C, K, L)
+
+            # split into FiLM params first, then optionally align each to x_in
+            gamma, beta = h_ref.chunk(2, dim=1)  # each: (B, C, K, L)
+            if self.use_adain_align:
+                # align gamma and beta separately to avoid channel-size collisions
+                gamma = self._adain_align(gamma, x_in)
+                beta = self._adain_align(beta, x_in)
+
+            # compute gating / alpha dynamic coefficients from original conditioning
+            gate_logits = self.gate_proj(c_in)
+            if self.freq_gate is not None:
+                gate_logits = gate_logits + self.freq_gate(c_in)
+            if self.use_pitch_aware_gate:
+                gate_logits = gate_logits + self.pitch_gain * self._pitch_proxy(c_in)
+            gate = torch.sigmoid(gate_logits)
+
+            # compute base alpha map (can be scalar or per-channel map)
+            # Fully dynamic alpha: let `alpha_proj` predict the per-channel map and
+            # use `alpha_max` as a hard upper bound to avoid explosion. If no
+            # `alpha_proj` is provided we fall back to the configured interaction_alpha.
+            if self.alpha_proj is not None:
+                # completely remove fixed-base interaction_alpha; alpha comes from network
+                alpha_map = self.alpha_max * torch.sigmoid(self.alpha_proj(c_in))
+            else:
+                # degenerate fallback: preserve some dynamic behaviour via the scalar
+                alpha_map = self.interaction_alpha
+
+            # Final injection weight = predicted map * frequency/pitch gate
+            alpha_total = alpha_map * gate
+
+            # store batch-wise mean for external inspection (debug/analysis)
+            try:
+                # mean over (C, K, L) -> per-sample mean of alpha_total
+                alpha_mean_per_sample = alpha_total.mean(dim=(1, 2, 3))
+                # detach and move to cpu for safe access from training loop
+                self._last_alpha_total_batch = alpha_mean_per_sample.detach().cpu()
+            except Exception:
+                pass
+            # FiLM-style affine modulation using tanh for stable +/- modulation
+            # F_fused = F_backbone + alpha_total * (tanh(gamma) * F_backbone + beta)
+            x_4d = x_in + alpha_total * (torch.tanh(gamma) * x_in + beta)
+        x_in = x_4d.squeeze(2) if squeezed else x_4d
+        return super().forward(x_in, c, t)
 
 
 class ADDSEDiT(nn.Module):

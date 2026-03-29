@@ -1,5 +1,6 @@
 import functools
 import math
+import re
 from abc import abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -256,6 +257,11 @@ class LightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.test_metrics = test_metrics
         self.log_cfg = LogConfig() if log_cfg is None else log_cfg
         self.debug_sample = debug_sample
+        # SDR EMA guard state: running SDR (EMA), smoothing and threshold for guard
+        self.register_buffer("running_sdr", torch.tensor(1.0))  # initial ~1.0 (0 dB)
+        # SDR EMA and threshold (expect metrics in dB). Use conservative smoothing.
+        self.sdr_ema_alpha = 0.95
+        self.sdr_threshold = -4.0  # in dB: trigger guard when running SDR falls below -4 dB
 
     @override
     def step(
@@ -575,12 +581,16 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         model: ADDSERQDiT,
         num_steps: int,
         block_size: int,
+        spec_loss: BaseLoss | None = None,
+        spec_loss_weight: float = 0.0,
         optimizer: Callable[[Iterator[nn.Parameter]], Optimizer] = Adam,
         lr_scheduler: Mapping[str, Any] | None = None,
         val_metrics: Mapping[str, BaseMetric] | None = None,
         test_metrics: Mapping[str, BaseMetric] | None = None,
         log_cfg: LogConfig | None = None,
         debug_sample: tuple[int, int] | None = None,
+        trainable_param_patterns: list[str] | None = None,
+        frozen_param_patterns: list[str] | None = None,
     ) -> None:
         """Initialize the ADDSE Lightning module."""
         super().__init__()
@@ -588,12 +598,49 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.model = model
         self.num_steps = num_steps
         self.block_size = block_size
+        self.spec_loss = spec_loss
+        self.spec_loss_weight = spec_loss_weight
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.val_metrics = val_metrics
         self.test_metrics = test_metrics
         self.log_cfg = LogConfig() if log_cfg is None else log_cfg
         self.debug_sample = debug_sample
+        self._apply_param_freeze(trainable_param_patterns, frozen_param_patterns)
+        # SDR EMA guard state (per-module) to support guard logic in step()
+        self.register_buffer("running_sdr", torch.tensor(1.0))
+        self.sdr_ema_alpha = 0.95
+        self.sdr_threshold = -4.0
+
+    def _apply_param_freeze(
+        self,
+        trainable_param_patterns: list[str] | None,
+        frozen_param_patterns: list[str] | None,
+    ) -> None:
+        """Apply trainable/frozen parameter masks on self.model only.
+
+        The NAC encoder/decoder is already frozen by load_nac(). This method controls
+        the trainable subset of the diffusion model for staged training.
+        """
+
+        named = list(self.model.named_parameters())
+        if trainable_param_patterns:
+            regs = [re.compile(p) for p in trainable_param_patterns]
+            for _, p in named:
+                p.requires_grad = False
+            for n, p in named:
+                if any(r.search(n) for r in regs):
+                    p.requires_grad = True
+
+        if frozen_param_patterns:
+            regs = [re.compile(p) for p in frozen_param_patterns]
+            for n, p in named:
+                if any(r.search(n) for r in regs):
+                    p.requires_grad = False
+
+        n_total = sum(p.numel() for _, p in named)
+        n_train = sum(p.numel() for _, p in named if p.requires_grad)
+        print(f"[trainable-mask] model trainable params: {n_train}/{n_total}")
 
     @override
     def step(
@@ -611,13 +658,76 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         xy_tok, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=True, domain="q")
         x_tok, y_tok = xy_tok.chunk(2)
         x_q, y_q = xy_q.chunk(2)
-        loss = {"loss": self.loss(x_q, y_q, y_tok)}
+        ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True)
+        loss: dict[str, Tensor] = {"loss_ce": ce_loss, "loss": ce_loss}
+
+        # --- spec loss warmup and temperature schedule ---
+        # warmup: first N epochs disable spec loss completely
+        warmup_epochs = 5
+        ramp_epochs = 5
+        start_spec_w = 0.01
+        # determine configured target weight
+        target_spec_w = float(self.spec_loss_weight if self.spec_loss_weight is not None else 0.0)
+        # compute effective spec weight for this epoch
+        if self.current_epoch < warmup_epochs:
+            effective_spec_w = 0.0
+        else:
+            # linear ramp from start_spec_w -> target_spec_w over ramp_epochs
+            ramp_progress = min(1.0, (self.current_epoch - warmup_epochs + 1) / max(1, ramp_epochs))
+            effective_spec_w = start_spec_w + ramp_progress * (target_spec_w - start_spec_w)
+
+        # temperature schedule for soft decode: 1.0 -> 0.5 over training
+        try:
+            total_epochs = float(self.trainer.max_epochs) if getattr(self, "trainer", None) is not None else 100.0
+        except Exception:
+            total_epochs = 100.0
+        tau_min = 0.5
+        tau_max = 1.0
+        tau = float(max(tau_min, tau_max - (tau_max - tau_min) * (self.current_epoch / max(1.0, total_epochs - 1.0))))
+
+        # --- SDR 守门员: 根据 running_sdr 的 EMA 动态衰减感知损失权重 ---
+        try:
+            sdr_val = float(self.running_sdr.detach().cpu().item())
+        except Exception:
+            sdr_val = 1.0
+        # sigmoid gate: 当 running_sdr 低于阈值时显著抑制感知损失
+        sigmoid_gate = 1.0 / (1.0 + math.exp(-(sdr_val - self.sdr_threshold)))
+        effective_spec_w = effective_spec_w * sigmoid_gate
+        if sdr_val < self.sdr_threshold:
+            effective_spec_w = effective_spec_w * 0.1
+            # 记录触发，便于汇报（值为 1.0 表示触发）
+            try:
+                self.log("spec_guard_active", 1.0)
+            except Exception:
+                pass
+
+        if self.spec_loss is not None and effective_spec_w > 0.0 and stage in ("train", "val"):
+            # pass log_score directly (log-probabilities) and let soft_decode_quantized handle temperature
+            y_hat_q = self.soft_decode_quantized(log_score, y_q, mask, tau=tau)
+            y_hat = self.nac.decode(y_hat_q.sum(dim=2), domain="q")
+            # waveform defenses: clamp values and replace NaNs/Infs before spec loss
+            y_hat = torch.clamp(y_hat, min=-10.0, max=10.0)
+            y_hat = torch.nan_to_num(y_hat, nan=0.0, posinf=10.0, neginf=-10.0)
+            spec_vals = self.spec_loss(y_hat, y)
+            spec_main = spec_vals["loss"]
+            loss["loss_spec"] = spec_main
+            for key, val in spec_vals.items():
+                if key != "loss":
+                    loss[f"spec_{key}"] = val
+            loss["loss"] = ce_loss + effective_spec_w * spec_main
         if metrics or stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]:
             y_hat_tok = self.solve(x_tok, x_q, self.num_steps)
             assert isinstance(y_hat_tok, Tensor)
             y_hat = self.nac.decode(y_hat_tok, domain="code")
             y_decoded = self.nac.decode(y_q, no_sum=True, domain="q")
             metric_vals = compute_metrics(y_hat, y, metrics)
+            # 更新 running_sdr EMA（如果 metric 提供了 `sdr`）
+            if hasattr(self, "running_sdr") and "sdr" in metric_vals:
+                try:
+                    sdr_tensor = torch.tensor(metric_vals["sdr"], device=self.running_sdr.device, dtype=self.running_sdr.dtype)
+                    self.running_sdr = self.sdr_ema_alpha * self.running_sdr + (1.0 - self.sdr_ema_alpha) * sdr_tensor
+                except Exception:
+                    pass
             debug_samples = (
                 {"input": x, "reference": y, "output": y_hat, "reference_decoded": y_decoded}
                 if self.current_epoch == 0
@@ -626,7 +736,9 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             return loss, metric_vals, debug_samples
         return loss, {}, {}
 
-    def loss(self, x_q: Tensor, y_q: Tensor, y_tok: Tensor) -> Tensor:
+    def loss(
+        self, x_q: Tensor, y_q: Tensor, y_tok: Tensor, return_intermediates: bool = False
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         r"""Compute the $\lambda$-denoising cross-entropy loss.
 
         Args:
@@ -636,6 +748,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
         Returns:
             The $\lambda$-denoising cross-entropy loss.
+            If `return_intermediates=True`, returns `(loss, log_score, mask)`.
         """
         lambd = torch.rand(y_tok.shape[0], device=y_tok.device)  # (B,)
         mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]  # (B, K, L)
@@ -644,7 +757,64 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         loss = torch.zeros(y_tok.shape, device=y_tok.device, dtype=log_score.dtype)  # (B, K, L)
         loss[mask] = torch.gather(log_score[mask], -1, y_tok[mask][:, None]).squeeze(-1)  # (N,)
         loss = -loss.mean(dim=(-1, -2)) / lambd  # (B,)
-        return loss.mean()
+        loss = loss.mean()
+        if return_intermediates:
+            return loss, log_score, mask
+        return loss
+
+    def soft_decode_quantized(self, logit_like: Tensor, y_q: Tensor, mask: Tensor, tau: float = 1.0) -> Tensor:
+        """Build differentiable quantized embeddings from token logits (or log-probabilities).
+
+        This function accepts either raw logits or log-probabilities (e.g. output of
+        `log_softmax`). Temperature is applied by dividing the input by `tau` before
+        applying softmax, avoiding unnecessary exp()/log() cycles for numerical stability.
+
+        Args:
+            logit_like: Token logits or log-probabilities with shape `(B, K, L, V)`.
+            y_q: Ground-truth quantized embeddings with shape `(B, C, K, L)`.
+            mask: Masked-token indicator with shape `(B, K, L)`.
+
+        Returns:
+            Quantized embeddings with shape `(B, C, K, L)` where masked positions
+            are replaced by soft codebook expectations.
+        """
+        soft_q = []
+        for codebook_idx, codebook in enumerate(self.nac.quantizer.codebooks):
+            logits = logit_like[:, codebook_idx]  # (B, L, V)
+            # apply temperature directly on logits/log-probabilities
+            p_t = torch.softmax(logits / float(max(1e-12, tau)), dim=-1)
+            w = codebook.codebook.weight.to(dtype=p_t.dtype)  # (V, D)
+            q_proj = p_t @ w  # (B, L, D)
+            q_proj = q_proj.transpose(1, 2)  # (B, D, L)
+            q = codebook.out_conv(q_proj)  # (B, C, L)
+            soft_q.append(q)
+        soft_q_stacked = torch.stack(soft_q, dim=2)  # (B, C, K, L)
+        # energy alignment: local sliding-window calibration along time (L)
+        eps = 1e-6
+        # collapse codebook axis by mean to obtain (B, C, L)
+        y_mean_k = y_q.mean(dim=2)  # (B, C, L)
+        soft_mean_k = soft_q_stacked.mean(dim=2)  # (B, C, L)
+        L_len = y_mean_k.shape[-1]
+        win = min(128, max(3, L_len // 8))
+        pad = win // 2
+        # per-channel moving mean and mean-square using grouped conv1d
+        def moving_std(t: Tensor) -> Tensor:
+            # t: (B, C, L)
+            B, C, L = t.shape
+            weight = t.new_ones((C, 1, win)) / float(win)
+            mean = F.conv1d(t, weight, padding=pad, groups=C)
+            mean_sq = F.conv1d(t * t, weight, padding=pad, groups=C)
+            var = (mean_sq - mean * mean).clamp_min(0.0)
+            return var.sqrt()
+
+        y_local_std = moving_std(y_mean_k).clamp_min(eps)  # (B, C, L)
+        soft_local_std = moving_std(soft_mean_k).clamp_min(eps)  # (B, C, L)
+        # aggregate local std to per-sample per-channel scalar by averaging across time
+        y_std = y_local_std.mean(dim=-1, keepdim=True).unsqueeze(2)  # (B, C, 1, 1)
+        soft_std = soft_local_std.mean(dim=-1, keepdim=True).unsqueeze(2)  # (B, C, 1, 1)
+        scale = y_std / soft_std
+        soft_q_stacked = soft_q_stacked * scale
+        return torch.where(mask[:, None], soft_q_stacked, y_q)
 
     @torch.no_grad()
     def solve(
@@ -1103,6 +1273,21 @@ def load_nac(cfg_path: str, ckpt_path: str) -> tuple[NAC, int]:
         cfg = yaml.safe_load(f)
     nac: NAC = instantiate(cfg["lm"]["generator"])
     ckpt = torch.load(ckpt_path, map_location="cpu")
+    # Diagnostic prints to validate the NAC checkpoint contents
+    try:
+        print("--- NAC Checkpoint Diagnostic ---")
+        print(f"Path: {ckpt_path}")
+        if isinstance(ckpt, dict):
+            if "epoch" in ckpt:
+                print(f"Pretrained Epoch: {ckpt.get('epoch')}")
+            if "callback_metrics" in ckpt:
+                try:
+                    print(f"Recon Loss: {ckpt['callback_metrics'].get('val_recon_loss', 'N/A')}")
+                except Exception:
+                    pass
+        print("---------------------------------")
+    except Exception:
+        pass
     state_dict = {k.removeprefix("generator."): v for k, v in ckpt["state_dict"].items() if k.startswith("generator.")}
     nac.load_state_dict(state_dict)
     nac.eval()
