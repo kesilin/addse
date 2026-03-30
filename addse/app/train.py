@@ -204,3 +204,6 @@ def train(
         ckpt_callback = trainer.checkpoint_callback
         ckpt_path = None if ckpt_callback is None else getattr(ckpt_callback, "best_model_path", None)
         trainer.test(lm, dm, None if ckpt_path == "" else ckpt_path)
+
+if __name__ == "__main__":
+    app()
