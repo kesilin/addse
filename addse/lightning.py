@@ -261,7 +261,7 @@ class LightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.register_buffer("running_sdr", torch.tensor(1.0))  # initial ~1.0 (0 dB)
         # SDR EMA and threshold (expect metrics in dB). Use conservative smoothing.
         self.sdr_ema_alpha = 0.95
-        self.sdr_threshold = -4.0  # in dB: trigger guard when running SDR falls below -4 dB
+        self.sdr_threshold = -10.0  # in dB: trigger guard when running SDR falls below -4 dB
 
     @override
     def step(

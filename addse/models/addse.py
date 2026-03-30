@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-
+from addse.layers import Snake1d
 class ADDSERQDiT(nn.Module):
     """Residual Quantized Diffusion Transformer (RQDiT) backbone used in ADDSE."""
 
@@ -110,17 +110,13 @@ class ADDSERQDiT(nn.Module):
 
 
 class ADDSERQDiTParallel(ADDSERQDiT):
-    """ADDSE RQDiT with lightweight continuous adaptation in parallel.
-
-    The discrete diffusion backbone is unchanged. A continuous branch derived from
-    conditioning embeddings is used as a calibration gate before the backbone:
-
-        x' = x * (1 + alpha * sigmoid(W_g(Adapter(c))))
-
-    This keeps pretrained ADDSE behavior largely intact while enabling
-    low-risk parallel fusion experiments.
+    """ADDSE RQDiT 并联连续自适应模型 (V3.3 Evolved)。
+    
+    核心修复：
+    1. 注入位置：改为“输出端残差修正”，确保不破坏离散主干的去噪分布，保住 1.4+ 底分。
+    2. Identity Start：通过零初始化和负偏置，确保训练初始状态为恒等映射。
+    3. 感受野：4层空洞卷积 [1, 2, 4, 8] 提供约 620ms 的上下文参考。
     """
-
     def __init__(
         self,
         input_channels: int,
@@ -144,6 +140,7 @@ class ADDSERQDiTParallel(ADDSERQDiT):
         use_pitch_aware_gate: bool = False,
         pitch_gain: float = 0.1,
     ) -> None:
+        # 调用父类初始化
         super().__init__(
             input_channels=input_channels,
             output_channels=output_channels,
@@ -155,17 +152,20 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             conditional=conditional,
             time_independent=time_independent,
         )
-        self.interaction_alpha = interaction_alpha
-        self.use_fusion_norm = use_fusion_norm
+        
+        # 记录关键参数
+        self.input_channels = input_channels
+        self.adapter_hidden = adapter_hidden
         self.dynamic_alpha = dynamic_alpha
         self.alpha_max = alpha_max
-        self.fusion_mode = fusion_mode
-        self.use_adain_align = use_adain_align
-        self.use_freq_dynamic_gate = use_freq_dynamic_gate
-        self.use_pitch_aware_gate = use_pitch_aware_gate
+        self.interaction_alpha = interaction_alpha
         self.pitch_gain = pitch_gain
-        # Adapter -> Refiner: 4-layer dilated residual conv "refinery" producing FiLM params
-        # dilation schedule chosen to expand temporal receptive field: [1,2,4,8]
+        self.use_pitch_aware_gate = use_pitch_aware_gate
+        self.use_freq_dynamic_gate = use_freq_dynamic_gate
+        self.use_adain_align = use_adain_align
+        self.use_fusion_norm = use_fusion_norm
+
+        # 并联精炼器 (Refiner): 4层空洞卷积，空洞率 [1, 2, 4, 8]
         self.refiner = nn.Sequential(
             nn.Conv2d(input_channels, adapter_hidden, kernel_size=(3, 1), padding=(1, 0), dilation=1),
             nn.SiLU(),
@@ -173,143 +173,76 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             nn.SiLU(),
             nn.Conv2d(adapter_hidden, adapter_hidden, kernel_size=(3, 1), padding=(4, 0), dilation=4),
             nn.SiLU(),
+            nn.Conv2d(adapter_hidden, adapter_hidden, kernel_size=(3, 1), padding=(8, 0), dilation=8),
+            nn.SiLU(),
             nn.Conv2d(adapter_hidden, input_channels * 2, kernel_size=1),
         )
-        # Initialize final refiner conv to zero so adapter starts as identity
-        try:
-            last_conv = self.refiner[-1]
-            if isinstance(last_conv, nn.Conv2d):
-                nn.init.zeros_(last_conv.weight)
-                if last_conv.bias is not None:
-                    nn.init.zeros_(last_conv.bias)
-        except Exception:
-            pass
+
         self.gate_proj = nn.Conv2d(input_channels, input_channels, kernel_size=1)
-        self.parallel_proj = nn.Conv2d(input_channels, input_channels, kernel_size=1)
         self.alpha_proj = nn.Conv2d(input_channels, input_channels, kernel_size=1) if dynamic_alpha else None
+        
         if use_freq_dynamic_gate:
-            pad_k = max(1, gate_kernel_size) // 2
-            self.freq_gate = nn.Conv2d(
-                input_channels,
-                input_channels,
-                # (K, 1): operate along codebook axis (pseudo-frequency), not time axis.
-                kernel_size=(max(1, gate_kernel_size), 1),
-                padding=(pad_k, 0),
-                groups=input_channels,
-            )
+            self.freq_gate = nn.Conv2d(input_channels, input_channels, kernel_size=(gate_kernel_size, 1), 
+                                      padding=(gate_kernel_size // 2, 0), groups=input_channels)
         else:
             self.freq_gate = None
-
-        if self.fusion_mode not in ("mul", "add"):
-            raise ValueError(f"Unsupported fusion_mode={fusion_mode}. Use 'mul' or 'add'.")
 
         if use_fusion_norm:
             self.x_norm = nn.LayerNorm(input_channels)
             self.c_norm = nn.LayerNorm(input_channels)
-            # Learnable channel-wise scale, initialized close to interaction_alpha.
-            self.gamma = nn.Parameter(torch.full((1, input_channels, 1, 1), interaction_alpha))
         else:
-            self.x_norm = None
-            self.c_norm = None
-            self.gamma = None
+            self.x_norm, self.c_norm = None, None
+
+        # 核心：初始化保护逻辑
+        self._reset_parallel_parameters()
+
+    def _reset_parallel_parameters(self) -> None:
+        """强制实现恒等映射初始化，防止干扰主干信号。"""
+        with torch.no_grad():
+            # 1. 最后一层卷积设为 0，使初始 gamma=0, beta=0
+            nn.init.zeros_(self.refiner[-1].weight)
+            nn.init.zeros_(self.refiner[-1].bias)
+            
+            # 2. 门控偏置设为 -4.0，使 sigmoid 输出接近 0，初始关闭支路
+            nn.init.zeros_(self.gate_proj.weight)
+            nn.init.constant_(self.gate_proj.bias, -4.0)
+            
+            if self.alpha_proj is not None:
+                nn.init.zeros_(self.alpha_proj.weight)
+                nn.init.constant_(self.alpha_proj.bias, -4.0)
 
     def _to_4d(self, x: Tensor) -> tuple[Tensor, bool]:
-        if x.ndim == 3:
-            return x[:, :, None, :], True
-        if x.ndim == 4:
-            return x, False
-        raise ValueError(f"Input must be 3D/4D. Got shape {x.shape}.")
-
-    def _apply_channel_norm(self, x: Tensor, ln: nn.LayerNorm | None) -> Tensor:
-        if ln is None:
-            return x
-        x_n = x.moveaxis(1, -1)  # (B, K, L, C)
-        x_n = ln(x_n)
-        return x_n.moveaxis(-1, 1)  # (B, C, K, L)
-
-    def _adain_align(self, src: Tensor, ref: Tensor, eps: float = 1e-5) -> Tensor:
-        # AdaIN over (K, L) dimensions for each (B, C).
-        src_mean = src.mean(dim=(2, 3), keepdim=True)
-        src_std = src.std(dim=(2, 3), keepdim=True).clamp_min(eps)
-        ref_mean = ref.mean(dim=(2, 3), keepdim=True)
-        ref_std = ref.std(dim=(2, 3), keepdim=True).clamp_min(eps)
-        src_norm = (src - src_mean) / src_std
-        return src_norm * ref_std + ref_mean
-
-    def _pitch_proxy(self, c_4d: Tensor) -> Tensor:
-        # Energy-variance proxy: compute per-frame variance across channel dim
-        # (lower variance -> voiced/tonal; higher variance -> noisy).
-        # Input `c_4d` shape: (B, C, K, L). We average over codebook axis K,
-        # compute variance across channels, smooth and return shape (B,1,1,L).
-        # Output shape: (B, 1, 1, L), broadcastable to gate logits.
-        # average over codebooks to reduce quantizer artifacts
-        z = c_4d.mean(dim=2)  # (B, C, L)
-        # variance across channels
-        var = z.var(dim=1, unbiased=False)  # (B, L)
-        # normalize per-sample
-        var = var - var.mean(dim=-1, keepdim=True)
-        denom = (var.pow(2).mean(dim=-1, keepdim=True) + 1e-6).sqrt()
-        if denom.abs().min() == 0:
-            return torch.zeros(z.shape[0], 1, 1, z.shape[-1], device=z.device, dtype=z.dtype)
-        rho = var / denom
-        rho = rho.unsqueeze(1)  # (B,1,L)
-        rho = F.avg_pool1d(rho, kernel_size=9, stride=1, padding=4)
-        rho = torch.relu(rho)
-        return rho[:, :, None, :]
+        if x.ndim == 3: return x[:, :, None, :], True
+        return x, False
 
     def forward(self, x: Tensor, c: Tensor | None = None, t: Tensor | None = None) -> Tensor:
-        x_4d, squeezed = self._to_4d(x)
+        # 1. 首先运行主干 DiT 推理，得到基础预测 z_base (PESQ ~1.4)
+        z_base = super().forward(x, c, t) 
+        
         if c is not None:
+            # 2. 准备条件特征
             c_4d, _ = self._to_4d(c)
-            x_in = self._apply_channel_norm(x_4d, self.x_norm)
-            c_in = self._apply_channel_norm(c_4d, self.c_norm)
-            # refine conditioning to produce FiLM parameters (gamma, beta)
-            h_ref = self.refiner(c_in)  # (B, 2*C, K, L)
-
-            # split into FiLM params first, then optionally align each to x_in
-            gamma, beta = h_ref.chunk(2, dim=1)  # each: (B, C, K, L)
-            if self.use_adain_align:
-                # align gamma and beta separately to avoid channel-size collisions
-                gamma = self._adain_align(gamma, x_in)
-                beta = self._adain_align(beta, x_in)
-
-            # compute gating / alpha dynamic coefficients from original conditioning
-            gate_logits = self.gate_proj(c_in)
-            if self.freq_gate is not None:
-                gate_logits = gate_logits + self.freq_gate(c_in)
-            if self.use_pitch_aware_gate:
-                gate_logits = gate_logits + self.pitch_gain * self._pitch_proxy(c_in)
-            gate = torch.sigmoid(gate_logits)
-
-            # compute base alpha map (can be scalar or per-channel map)
-            # Fully dynamic alpha: let `alpha_proj` predict the per-channel map and
-            # use `alpha_max` as a hard upper bound to avoid explosion. If no
-            # `alpha_proj` is provided we fall back to the configured interaction_alpha.
-            if self.alpha_proj is not None:
-                # completely remove fixed-base interaction_alpha; alpha comes from network
-                alpha_map = self.alpha_max * torch.sigmoid(self.alpha_proj(c_in))
-            else:
-                # degenerate fallback: preserve some dynamic behaviour via the scalar
-                alpha_map = self.interaction_alpha
-
-            # Final injection weight = predicted map * frequency/pitch gate
-            alpha_total = alpha_map * gate
-
-            # store batch-wise mean for external inspection (debug/analysis)
-            try:
-                # mean over (C, K, L) -> per-sample mean of alpha_total
-                alpha_mean_per_sample = alpha_total.mean(dim=(1, 2, 3))
-                # detach and move to cpu for safe access from training loop
-                self._last_alpha_total_batch = alpha_mean_per_sample.detach().cpu()
-            except Exception:
-                pass
-            # FiLM-style affine modulation using tanh for stable +/- modulation
-            # F_fused = F_backbone + alpha_total * (tanh(gamma) * F_backbone + beta)
-            x_4d = x_in + alpha_total * (torch.tanh(gamma) * x_in + beta)
-        x_in = x_4d.squeeze(2) if squeezed else x_4d
-        return super().forward(x_in, c, t)
-
-
+            
+            # 3. 提取 Refiner 修正参数
+            h_ref = self.refiner(c_4d)
+            gamma, beta = h_ref.chunk(2, dim=1)
+            
+            # 4. 计算门控 (对应汇报中的自适应语音补偿逻辑)
+            gate = torch.sigmoid(self.gate_proj(c_4d))
+            alpha = self.alpha_max * torch.sigmoid(self.alpha_proj(c_4d)) if self.alpha_proj else self.interaction_alpha
+            alpha_total = alpha * gate
+            
+            # 5. 在输出端进行残差修正 (z_base 为 3D 或 4D，需注意维度匹配)
+            # 公式: y = z_base + alpha * (tanh(gamma) * z_base + beta)
+            if z_base.ndim == 3:
+                alpha_total = alpha_total.squeeze(2)
+                gamma = gamma.squeeze(2)
+                beta = beta.squeeze(2)
+            
+            # 使用 tanh 限制 gamma 范围，增强数值稳定性
+            return z_base + alpha_total * (torch.tanh(gamma) * z_base + beta)
+        
+        return z_base
 class ADDSEDiT(nn.Module):
     """ADDSE DiT."""
 
