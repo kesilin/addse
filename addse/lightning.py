@@ -644,6 +644,26 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             y_tok[mask] = torch.multinomial(log_p[mask].exp(), 1).squeeze(-1)
         return y_tok
 
+    def forward(self, x: torch.Tensor, return_nfe: bool = False, **kwargs):
+        """Enhance the input audio during inference."""
+        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional, got shape {x.shape}"
+        # 0. 边缘 Padding：确保输入长度是模型下采样率的整数倍
+        n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
+        x_pad = F.pad(x, (0, n_pad))
+        # 1. 提取 Pre-VQ 连续细粮
+        x_lat = self.nac.encoder(x_pad)
+        # 2. 提取 Post-VQ 离散粗粮
+        x_tok, x_q = self.nac.encode(x_pad, no_sum=True, domain="q")
+        # 3. 传入 solve 进行扩散采样交互
+        y_hat_tok = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
+        # 4. 解码为音频波形
+        y_hat_pad = self.nac.decode(y_hat_tok, domain="code")
+        # 5. 裁剪掉 Padding 部分，还原真实长度
+        y_hat = y_hat_pad[..., : y_hat_pad.shape[-1] - n_pad]
+        if return_nfe:
+            return y_hat, self.num_steps
+        return y_hat
+
 class NACSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     """Lightning module for speech enhancement using NAC-domain direct prediction."""
 
