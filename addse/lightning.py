@@ -571,104 +571,68 @@ class NACLightningModule(BaseLightningModule):
 
 
 class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
-    """ADDSE Lightning Module (Feature Decoupling Edition)."""
-
-    def __init__(self, nac_cfg: str, nac_ckpt: str, model: ADDSERQDiT, num_steps: int, block_size: int,
-        spec_loss: BaseLoss | None = None, spec_loss_weight: float = 0.0,
-        optimizer: Callable[[Iterator[nn.Parameter]], Optimizer] = Adam,
-        lr_scheduler: Mapping[str, Any] | None = None,
-        val_metrics: Mapping[str, BaseMetric] | None = None,
-        test_metrics: Mapping[str, BaseMetric] | None = None,
-        log_cfg: LogConfig | None = None, debug_sample: tuple[int, int] | None = None,
-        trainable_param_patterns: list[str] | None = None, frozen_param_patterns: list[str] | None = None,
-    ) -> None:
+    def __init__(self, nac_cfg: str, nac_ckpt: str, model: ADDSERQDiT, num_steps: int, block_size: int, **kwargs) -> None:
         super().__init__()
         self.nac, self.mask_token = load_nac(nac_cfg, nac_ckpt)
         self.model, self.num_steps, self.block_size = model, num_steps, block_size
-        self.spec_loss, self.spec_loss_weight = spec_loss, spec_loss_weight
-        self.optimizer, self.lr_scheduler = optimizer, lr_scheduler
-        self.val_metrics, self.test_metrics = val_metrics, test_metrics
-        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
-        self.debug_sample = debug_sample
-        self._apply_param_freeze(trainable_param_patterns, frozen_param_patterns)
+        self.spec_loss = kwargs.get("spec_loss")
+        self.spec_loss_weight = kwargs.get("spec_loss_weight", 0.0)
+        self.optimizer, self.lr_scheduler = kwargs.get("optimizer"), kwargs.get("lr_scheduler")
+        self.val_metrics = kwargs.get("val_metrics")
         self.register_buffer("running_sdr", torch.tensor(1.0))
         self.sdr_ema_alpha, self.sdr_threshold = 0.95, -4.0
-
-    def _apply_param_freeze(self, trainable, frozen) -> None:
-        named = list(self.model.named_parameters())
-        if trainable:
-            regs = [re.compile(p) for p in trainable]
-            for _, p in named: p.requires_grad = False
-            for n, p in named:
-                if any(r.search(n) for r in regs): p.requires_grad = True
-        if frozen:
-            regs = [re.compile(p) for p in frozen]
-            for n, p in named:
-                if any(r.search(n) for r in regs): p.requires_grad = False
-        print(f"[trainable-mask] model trainable params: {sum(p.numel() for _, p in named if p.requires_grad)}/{sum(p.numel() for _, p in named)}")
 
     @override
     def step(self, batch, stage, batch_idx, metrics=None):
         x, y, _ = batch
-        if stage == "test":
-            n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
-            x, y = F.pad(x, (0, n_pad)), F.pad(y, (0, n_pad))
-
-        # --- 【核心改进：特征双轨提取】 ---
-        # 1. 提取连续高精度 Latent (给并联支路)
+        # 1. 提取 Pre-VQ 连续细粮
         x_lat = self.nac.encoder(x)
-        y_lat = self.nac.encoder(y)
         
-        # 2. 安全获取离散索引 Token (使用切片，解决 ValueError)
-        y_q_full = self.nac.quantizer(y_lat)
-        y_q, y_tok = y_q_full[0], y_q_full[1] # 离散粗粮
-        
-        x_q_full = self.nac.quantizer(x_lat)
-        x_q, x_tok = x_q_full[0], x_q_full[1] # 离散粗粮
+        # 2. 提取 Post-VQ 离散粗粮 (解决 ValueError)
+        xy_tok, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=True, domain="q")
+        x_tok, y_tok = xy_tok.chunk(2); x_q, y_q = xy_q.chunk(2)
 
-        # 3. 传入 loss，x_cont=x_lat 确保 Refiner 吃到细粮
+        # 3. 传入 loss
         ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat)
-        loss_dict: dict[str, Tensor] = {"loss_ce": ce_loss, "loss": ce_loss}
-
-        if metrics or (stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]):
+        
+        if metrics or (stage == "val" and batch_idx == 0):
             y_hat_tok = self.solve(x_tok, x_q, self.num_steps)
             y_hat = self.nac.decode(y_hat_tok, domain="code")
-            metric_vals = compute_metrics(y_hat, y, metrics)
-            return loss_dict, metric_vals, {"output": y_hat, "input": x, "clean": y}
-        return loss_dict, {}, {}
+            return {"loss": ce_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
+        return {"loss": ce_loss}, {}, {}
 
     def loss(self, x_q, y_q, y_tok, return_intermediates=False, x_cont=None):
-        B, K, L = y_tok.shape; V = self.model.output_channels # 现在 output_channels 存在了
+        B, K, L = y_tok.shape
         lambd = torch.rand(B, device=y_tok.device)
         mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]
-        y_lambda_q = y_q.masked_fill(mask[:, None], 0)
+        # 修正维度对齐逻辑
+        y_lambda_q = y_q.clone()
+        y_lambda_q.masked_fill_(mask[:, None], 0)
         
         log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
-        
+        V = log_score.shape[-1]
         loss = F.cross_entropy(log_score.reshape(-1, V), y_tok.reshape(-1), reduction="none")
         loss = (loss.reshape(B, K, L) * mask).sum() / (mask.sum() + 1e-8)
         return (loss, log_score, mask) if return_intermediates else loss
 
-    def log_score(self, y_q: Tensor, x_q: Tensor, x_cont: Tensor | None = None) -> Tensor:
-        # 保护：如果 x_cont 为 None，传占位符
-        x_cont_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
+    def log_score(self, y_q, x_q, x_cont=None):
+        # 推理或块处理时的占位符
+        x_c_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
         def model_wrapper(y_s, x_s, c_s):
             return self.model(y_s, x_s, None, c_cont=c_s)
-        score = process_in_blocks((y_q, x_q, x_cont_in), self.block_size, model_wrapper)
+        score = process_in_blocks((y_q, x_q, x_c_in), self.block_size, model_wrapper)
         return score.moveaxis(1, -1).log_softmax(dim=-1)
 
-    # 其余逻辑保持原样，采样时依然使用 x_q 保底
     @torch.no_grad()
     def solve(self, x_tok, x_q, num_steps):
         y_tok = torch.full_like(x_tok, self.mask_token)
         for i in range(num_steps):
             mask = y_tok == self.mask_token
-            y_lat_temp = self.nac.quantizer.decode(y_tok.masked_fill(mask, 0), output_no_sum=True, domain="code")
-            y_q = y_lat_temp.masked_fill(mask[:, None], 0)
+            # 使用 NAC 内部方法避开维度陷阱
+            y_q = self.nac.encode_from_code(y_tok.masked_fill(mask, 0), no_sum=True, domain="q")[1].masked_fill(mask[:, None], 0)
             log_p = self.log_score(y_q, x_q)
             y_tok[mask] = torch.multinomial(log_p[mask].exp(), 1).squeeze(-1)
         return y_tok
-
 
 class NACSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     """Lightning module for speech enhancement using NAC-domain direct prediction."""

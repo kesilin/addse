@@ -5,19 +5,19 @@ from torch import Tensor
 from addse.layers import Snake1d
 
 def get_rot_emb(dim: int, max_seq_len: int) -> tuple[Tensor, Tensor]:
-    """计算旋转位置编码，放在文件顶部确保所有类可见。"""
+    """Compute rotary embeddings."""
     assert dim % 2 == 0
     pos = torch.arange(max_seq_len)
     omega = 1 / 10000 ** (torch.arange(0, dim, 2) / dim)
     angles = pos[:, None] * omega[None, :]
-    return angles.cos().repeat_interleave(2, dim=-1), angles.sin().repeat_interleave(2, dim=-1)
+    cos = angles.cos().repeat_interleave(2, dim=-1)
+    sin = angles.sin().repeat_interleave(2, dim=-1)
+    return cos, sin
 
 class ADDSERQDiT(nn.Module):
-    """Backbone RQDiT: 保住 1.7 分基础语义的核心。"""
     def __init__(self, input_channels, output_channels, num_codebooks, hidden_dim, num_layers, num_heads, max_seq_len, conditional, time_independent):
         super().__init__()
-        self.input_channels = input_channels
-        self.output_channels = output_channels # 关键：显式保存
+        self.output_channels = output_channels # 关键：保存此属性
         elementwise_affine = not conditional and time_independent
         self.input_proj_x = nn.Linear(input_channels, hidden_dim)
         self.input_proj_c = nn.Linear(input_channels, hidden_dim) if conditional else None
@@ -47,36 +47,19 @@ class ADDSERQDiT(nn.Module):
             x_p = self.dep_dit(x_p.transpose(1, 2).reshape(B * L, K, -1), c_dep, t_dep).reshape(B, L, K, -1).transpose(1, 2)
         else: x_p = h[:, None]
         
-        # 处理 AdaLN 调节
         cond = c if t is None else (t[:, None, None] if c is None else (c + t[:, None, None]) * self.skip_scale)
-        if cond is not None and self.output_adaln:
-            # 确保 condition 映射到 hidden_dim
-            cond_p = self.input_proj_c(cond.moveaxis(1, -1)) if self.input_proj_c else cond
-            shift, scale = self.output_adaln(cond_p).chunk(2, dim=-1)
-            x_p = (self.output_norm(x_p) * (1 + scale) + shift) * self.skip_scale
-        else:
-            x_p = self.output_norm(x_p) * self.skip_scale
-            
+        shift, scale = self.output_adaln(self.input_proj_c(cond.moveaxis(1, -1)) if self.input_proj_c and cond is not None else cond).chunk(2, dim=-1) if self.output_adaln and cond is not None else (0, 0)
+        x_p = (self.output_norm(x_p) * (1 + scale) + shift) * self.skip_scale
         x_out = self.output_proj(x_p).moveaxis(-1, 1)
         return x_out.squeeze(2) if squeeze_output else x_out
 
 class ADDSERQDiTParallel(ADDSERQDiT):
-    """ADDSE V3.3 Evolved: 
-    输出端修正 + 特征双轨 (粗粮喂主干，细粮喂 Refiner)。
-    """
+    """V3.3 Evolved: 特征双轨制 + 输出侧修正架构。"""
     def __init__(self, **kwargs) -> None:
-        # 第一时间保存并传递 output_channels
-        self.output_channels = kwargs.get("output_channels")
-        self.adapter_hidden = kwargs.get("adapter_hidden", 256)
+        self.input_channels, self.adapter_hidden = kwargs.get("input_channels"), kwargs.get("adapter_hidden", 256)
         self.alpha_max, self.interaction_alpha = kwargs.get("alpha_max", 0.08), kwargs.get("interaction_alpha", 0.1)
-        self.dynamic_alpha = kwargs.get("dynamic_alpha", False)
+        super().__init__(**{k: v for k, v in kwargs.items() if k in ["input_channels", "output_channels", "num_codebooks", "hidden_dim", "num_layers", "num_heads", "max_seq_len", "conditional", "time_independent"]})
         
-        # 严格对齐父类初始化
-        p_keys = ["input_channels", "output_channels", "num_codebooks", "hidden_dim", "num_layers", "num_heads", "max_seq_len", "conditional", "time_independent"]
-        f_kwargs = {k: v for k, v in kwargs.items() if k in p_keys}
-        super().__init__(**f_kwargs)
-
-        # Refiner 保持不变
         self.refiner = nn.Sequential(
             nn.Conv2d(self.input_channels, self.adapter_hidden, kernel_size=(3, 1), padding=(1, 0), dilation=1),
             Snake1d(self.adapter_hidden), 
@@ -89,7 +72,6 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             nn.Conv2d(self.adapter_hidden, self.input_channels * 2, kernel_size=1),
         )
         self.gate_proj = nn.Conv2d(self.input_channels, self.input_channels, kernel_size=1)
-        self.alpha_proj = nn.Conv2d(self.input_channels, self.input_channels, kernel_size=1) if self.dynamic_alpha else None
         self._reset_parallel_parameters()
 
     def _reset_parallel_parameters(self) -> None:
@@ -98,17 +80,15 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             nn.init.constant_(self.gate_proj.bias, -4.0)
 
     def forward(self, x, c, t, c_cont=None):
-        # 【复活主干】传入真实的离散条件 c，重回 1.7 分高水准
+        # 1. 离散粗粮喂主干，保住 1.7 分
         z_base = super().forward(x, c, t) 
         
-        # 【细粮直通】Refiner 支路使用 Pre-VQ 连续特征 c_cont
+        # 2. 连续细粮喂 Refiner，突破 1.8 分
         c_ref = c_cont if c_cont is not None else c
         if c_ref is not None:
             c_4d = c_ref[:, :, None, :] if c_ref.ndim == 3 else c_ref
             gamma, beta = self.refiner(c_4d).chunk(2, dim=1)
-            gate = torch.sigmoid(self.gate_proj(c_4d))
-            alpha = self.alpha_max * torch.sigmoid(self.alpha_proj(c_4d)) if self.alpha_proj else self.interaction_alpha
-            alpha_total = alpha * gate
+            alpha_total = self.interaction_alpha * torch.sigmoid(self.gate_proj(c_4d))
             if z_base.ndim == 3: alpha_total, gamma, beta = alpha_total.squeeze(2), gamma.squeeze(2), beta.squeeze(2)
             return z_base + alpha_total * (torch.tanh(gamma) * z_base + beta)
         return z_base
