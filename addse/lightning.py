@@ -573,9 +573,10 @@ class NACLightningModule(BaseLightningModule):
 class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     """ADDSE V3.3 Evolved Lightning Module.
     
-    核心进化：
-    1. 特征双轨制：Backbone 接收离散 Token (粗粮) 保住 1.7 分底座；Refiner 接收连续 Latent (细粮) 冲击 1.8+。
-    2. 鲁棒性保护：解决了 NoneType 导致的推理崩溃问题。
+    进化点：
+    1. 修复 ValueError：正确解包量化器的 3 个返回值。
+    2. 特征双轨：主干用 x_q (离散)，并联支路用 x_lat (连续)。
+    3. 鲁棒推理：解决 process_in_blocks 在处理连续特征时的 NoneType 崩溃。
     """
 
     def __init__(
@@ -599,20 +600,15 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         super().__init__()
         self.nac, self.mask_token = load_nac(nac_cfg, nac_ckpt)
         self.model = model
-        self.num_steps = num_steps
-        self.block_size = block_size
-        self.spec_loss = spec_loss
-        self.spec_loss_weight = spec_loss_weight
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.val_metrics = val_metrics
-        self.test_metrics = test_metrics
+        self.num_steps, self.block_size = num_steps, block_size
+        self.spec_loss, self.spec_loss_weight = spec_loss, spec_loss_weight
+        self.optimizer, self.lr_scheduler = optimizer, lr_scheduler
+        self.val_metrics, self.test_metrics = val_metrics, test_metrics
         self.log_cfg = LogConfig() if log_cfg is None else log_cfg
         self.debug_sample = debug_sample
         self._apply_param_freeze(trainable_param_patterns, frozen_param_patterns)
         self.register_buffer("running_sdr", torch.tensor(1.0))
-        self.sdr_ema_alpha = 0.95
-        self.sdr_threshold = -4.0
+        self.sdr_ema_alpha, self.sdr_threshold = 0.95, -4.0
 
     def _apply_param_freeze(self, trainable, frozen) -> None:
         named = list(self.model.named_parameters())
@@ -641,66 +637,90 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
             x, y = F.pad(x, (0, n_pad)), F.pad(y, (0, n_pad))
 
-        # --- 关键逻辑：手动拆解 NAC 提取 Pre-VQ 连续特征 ---
-        # 1. 提取 clean 音频的高精度 Latent
+        # --- 【关键修复】手动提取特征双轨并正确解包 ---
+        # 1. 提取 clean 音频特征 (y_lat 为连续，y_tok 为离散索引)
         y_lat = self.nac.encoder(y)
-        y_q, y_tok = self.nac.quantizer(y_lat)
+        y_q, y_tok, _ = self.nac.quantizer(y_lat) # 增加 _ 接收 quant_loss
 
-        # 2. 提取 noisy 音频的高精度 Latent (给 Refiner) 和离散 Token (给 Backbone)
+        # 2. 提取 noisy 音频特征 (x_lat 给 Refiner，x_q 给 Backbone)
         x_lat = self.nac.encoder(x)
-        x_q, x_tok = self.nac.quantizer(x_lat)
+        x_q, x_tok, _ = self.nac.quantizer(x_lat) # 增加 _ 接收 quant_loss
 
         # 3. 传入 loss，x_cont=x_lat 确保 Refiner 吃到细粮
         ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat)
-        loss: dict[str, Tensor] = {"loss_ce": ce_loss, "loss": ce_loss}
+        loss_dict: dict[str, Tensor] = {"loss_ce": ce_loss, "loss": ce_loss}
 
-        # 后续 spec_loss 和 temperature 逻辑保持原样
+        # 后续 spec_loss warmup 逻辑保持原样
         warmup_epochs, ramp_epochs, start_spec_w = 5, 5, 0.01
         target_spec_w = float(self.spec_loss_weight if self.spec_loss_weight is not None else 0.0)
         effective_spec_w = 0.0 if self.current_epoch < warmup_epochs else \
             start_spec_w + min(1.0, (self.current_epoch - warmup_epochs + 1) / ramp_epochs) * (target_spec_w - start_spec_w)
-
-        # SDR Guard 守门员逻辑
-        sdr_val = float(self.running_sdr.detach().cpu().item())
-        sigmoid_gate = 1.0 / (1.0 + math.exp(-(sdr_val - self.sdr_threshold)))
-        effective_spec_w *= sigmoid_gate
-        if sdr_val < self.sdr_threshold: effective_spec_w *= 0.1
 
         if self.spec_loss is not None and effective_spec_w > 0.0 and stage in ("train", "val"):
             y_hat_q = self.soft_decode_quantized(log_score, y_q, mask, tau=1.0)
             y_hat = self.nac.decode(y_hat_q.sum(dim=2), domain="q")
             y_hat = torch.nan_to_num(torch.clamp(y_hat, -10.0, 10.0), 0.0)
             spec_vals = self.spec_loss(y_hat, y)
-            loss["loss_spec"] = spec_vals["loss"]
-            loss["loss"] = ce_loss + effective_spec_w * spec_vals["loss"]
+            loss_dict["loss_spec"] = spec_vals["loss"]
+            loss_dict["loss"] = ce_loss + effective_spec_w * spec_vals["loss"]
 
         if metrics or (stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]):
             y_hat_tok = self.solve(x_tok, x_q, self.num_steps)
             y_hat = self.nac.decode(y_hat_tok, domain="code")
             metric_vals = compute_metrics(y_hat, y, metrics)
-            if "sdr" in metric_vals:
-                self.running_sdr = self.sdr_ema_alpha * self.running_sdr + (1.0 - self.sdr_ema_alpha) * torch.tensor(metric_vals["sdr"], device=self.running_sdr.device)
-            return loss, metric_vals, {"output": y_hat, "input": x, "clean": y}
+            return loss_dict, metric_vals, {"output": y_hat, "input": x, "clean": y}
         
-        return loss, {}, {}
+        return loss_dict, {}, {}
 
     def loss(
         self, x_q: Tensor, y_q: Tensor, y_tok: Tensor, return_intermediates: bool = False, x_cont: Tensor | None = None
     ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
         B, K, L = y_tok.shape
-        # 使用随机 lambda 掩码扩散步
         lambd = torch.rand(B, device=y_tok.device)
         mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]
         y_lambda_q = y_q.masked_fill(mask[:, None], 0)
         
-        # 透传连续特征 x_cont
+        # 将连续特征透传给 log_score
         log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
         
-        loss = torch.zeros(y_tok.shape, device=y_tok.device, dtype=log_score.dtype)
-        loss[mask] = torch.gather(log_score[mask], -1, y_tok[mask][:, None]).squeeze(-1)
-        loss = -loss.mean(dim=(-1, -2)) / lambd
-        loss = loss.mean()
+        V = log_score.shape[-1]
+        loss = F.cross_entropy(log_score.reshape(-1, V), y_tok.reshape(-1), reduction="none")
+        loss = (loss.reshape(B, K, L) * mask).sum() / (mask.sum() + 1e-8)
+        
         return (loss, log_score, mask) if return_intermediates else loss
+
+    def log_score(self, y_q: Tensor, x_q: Tensor, x_cont: Tensor | None = None) -> Tensor:
+        """核心修复：处理块级推理并实现特征双轨直通。"""
+        # 保护：如果 x_cont 为 None (如推理时)，传一个占位符确保 process_in_blocks 不崩溃
+        x_cont_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
+
+        def model_wrapper(y_slice, x_slice, cont_slice):
+            # 将 x_slice 给主干 (c)，cont_slice 给 Refiner (c_cont)
+            return self.model(y_slice, x_slice, None, c_cont=cont_slice)
+
+        score = process_in_blocks((y_q, x_q, x_cont_in), self.block_size, model_wrapper)
+        return score.moveaxis(1, -1).log_softmax(dim=-1)
+
+    @torch.no_grad()
+    def solve(self, x_tok: Tensor, x_q: Tensor, num_steps: int) -> Tensor:
+        self.model.eval()
+        y_tok = torch.full_like(x_tok, self.mask_token)
+        for i in range(num_steps):
+            mask = y_tok == self.mask_token
+            # 正确调用解包量化器
+            y_lat_temp = self.nac.quantizer.decode(y_tok.masked_fill(mask, 0), output_no_sum=True, domain="code")
+            y_q = y_lat_temp.masked_fill(mask[:, None], 0)
+            log_p = self.log_score(y_q, x_q)
+            y_tok[mask] = torch.multinomial(log_p[mask].exp(), 1).squeeze(-1)
+        return y_tok
+
+    def forward(self, x: Tensor) -> Tensor:
+        n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
+        x_pad = F.pad(x, (0, n_pad))
+        x_tok, x_q, _ = self.nac.encode(x_pad, no_sum=True, domain="q") # 增加 _ 接收
+        y_tok = self.solve(x_tok, x_q, self.num_steps)
+        y_pad = self.nac.decode(y_tok, domain="code")
+        return y_pad[..., : y_pad.shape[-1] - n_pad]
 
     def soft_decode_quantized(self, logit_like: Tensor, y_q: Tensor, mask: Tensor, tau: float = 1.0) -> Tensor:
         soft_q = []
@@ -709,7 +729,6 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             q = codebook.out_conv((p_t @ codebook.codebook.weight.to(dtype=p_t.dtype)).transpose(1, 2))
             soft_q.append(q)
         soft_q_stacked = torch.stack(soft_q, dim=2)
-        # 能量对齐逻辑...
         return torch.where(mask[:, None], soft_q_stacked, y_q)
 
     @torch.no_grad()
