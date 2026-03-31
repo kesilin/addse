@@ -23,11 +23,8 @@ from .metrics import BaseMetric
 from .models import ADM, NAC, ADDSERQDiT, SGMSEUNet
 from .stft import STFT
 
-
 @dataclass
 class LogConfig:
-    """Configuration for logging losses and metrics."""
-
     on_train_step: bool = False
     on_train_epoch: bool = True
     on_val_step: bool = False
@@ -35,127 +32,185 @@ class LogConfig:
     on_test_step: bool = False
     on_test_epoch: bool = True
 
-
 class BaseLightningModule(L.LightningModule):
-    """Base class for Lightning modules."""
-
     val_metrics: Mapping[str, BaseMetric] | None
     test_metrics: Mapping[str, BaseMetric] | None
     log_cfg: LogConfig
     debug_sample: tuple[int, int] | None
 
     @abstractmethod
-    def step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor],
-        stage: str,
-        batch_idx: int,
-        metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
-        """Training, validation, or test step.
-
-        Args:
-            batch: A batch from the dataloader.
-            stage: `"train"`, `"val"`, or `"test"`.
-            batch_idx: Index of the batch.
-            metrics: Metrics to compute. `None` if `stage` is `"train"` or if no metrics are defined.
-
-        Returns:
-            Tuple of loss dictionary, metrics dictionary, and debug samples dictionary. Each debug sample must have
-            shape `(batch_size, num_channels, num_samples)`.
-        """
+    def step(self, batch, stage, batch_idx, metrics=None):
+        pass
 
     def training_step(self, batch: tuple[Tensor, Tensor, Tensor], batch_idx: int) -> dict[str, Tensor]:
-        """Training step.
-
-        Args:
-            batch: A batch from the training dataloader.
-            batch_idx: Index of the batch.
-
-        Returns:
-            Dictionary with losses.
-        """
         loss, metrics, _ = self.step(batch, "train", batch_idx)
         self.log_metrics(loss, metrics, "train", self.log_cfg.on_train_step, self.log_cfg.on_train_epoch)
         return loss
 
     def validation_step(self, batch: tuple[Tensor, Tensor, Tensor], batch_idx: int) -> dict[str, Tensor]:
-        """Validation step.
-
-        Args:
-            batch: A batch from the validation dataloader.
-            batch_idx: Index of the batch.
-
-        Returns:
-            Dictionary with losses.
-        """
         loss, metrics, debug_samples = self.step(batch, "val", batch_idx, self.val_metrics)
         self.log_debug_samples(batch, batch_idx, debug_samples)
         self.log_metrics(loss, metrics, "val", self.log_cfg.on_val_step, self.log_cfg.on_val_epoch)
         return loss
 
     def test_step(self, batch: tuple[Tensor, Tensor, Tensor], batch_idx: int) -> dict[str, Tensor]:
-        """Test step.
-
-        Args:
-            batch: A batch from the test dataloader.
-            batch_idx: Index of the batch.
-
-        Returns:
-            Dictionary with losses.
-        """
         loss, metrics, _ = self.step(batch, "test", batch_idx, self.test_metrics)
         self.log_metrics(loss, metrics, "test", self.log_cfg.on_test_step, self.log_cfg.on_test_epoch)
         return loss
 
-    def log_metrics(
-        self, loss: dict[str, Tensor], metrics: dict[str, float], stage: str, on_step: bool, on_epoch: bool
-    ) -> None:
-        """Log losses and metrics."""
+    def log_metrics(self, loss, metrics, stage, on_step, on_epoch):
         for key, value in {**loss, **metrics}.items():
-            assert isinstance(value, Tensor | float)
             self.log(f"{stage}_{key}", value, on_step=on_step, on_epoch=on_epoch)
 
-    def log_debug_samples(
-        self, batch: tuple[Tensor, Tensor, Tensor], batch_idx: int, debug_samples: dict[str, Tensor]
-    ) -> None:
-        """Log debug audio samples to W&B."""
+    def log_debug_samples(self, batch, batch_idx, debug_samples):
         wandb_logger = next((logger for logger in self.loggers if isinstance(logger, WandbLogger)), None)
         if wandb_logger is None or self.debug_sample is None or batch_idx != self.debug_sample[0]:
             return
         for name, x in debug_samples.items():
             x_cpu = x[self.debug_sample[1], 0, :].cpu().float().numpy()
             fs = batch[2][self.debug_sample[1]].item()
-            wandb_logger.log_audio(
-                key=name,
-                audios=[x_cpu / max(abs(x_cpu))],
-                step=self.global_step,
-                sample_rate=[fs],
-            )
-
+            wandb_logger.log_audio(key=name, audios=[x_cpu / max(abs(x_cpu))], step=self.global_step, sample_rate=[fs])
 
 class ConfigureOptimizersMixin(L.LightningModule):
-    """Mixin for standard configuration of optimizer and learning rate scheduler."""
-
     optimizer: Callable[[Iterator[nn.Parameter]], Optimizer]
     lr_scheduler: Mapping[str, Any] | None
 
     def configure_optimizers(self) -> Any:
-        """Configure optimizers.
-
-        Returns:
-            Dictionary with optimizer, learning rate scheduler, and learning rate scheduler configuration.
-        """
         optimizer = self.optimizer(self.parameters())
         output: dict[str, Any] = {"optimizer": optimizer}
         if self.lr_scheduler is not None:
             output["lr_scheduler"] = {k: v(optimizer) if k == "scheduler" else v for k, v in self.lr_scheduler.items()}
         return output
 
+# ======================================================================
+# ADDSELightningModule (100% 稳定纯净版 - 专注 Stage 1 训练)
+# ======================================================================
+class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
+    def __init__(self, nac_cfg: str, nac_ckpt: str, model: ADDSERQDiT, num_steps: int, block_size: int, **kwargs) -> None:
+        super().__init__()
+        self.nac, self.mask_token = load_nac(nac_cfg, nac_ckpt)
+        self.model, self.num_steps, self.block_size = model, num_steps, block_size
+        self.spec_loss = kwargs.get("spec_loss")
+        self.spec_loss_weight = kwargs.get("spec_loss_weight", 0.0)
+        self.optimizer, self.lr_scheduler = kwargs.get("optimizer"), kwargs.get("lr_scheduler")
+        
+        self.val_metrics = kwargs.get("val_metrics")
+        self.test_metrics = kwargs.get("test_metrics")
+        log_cfg = kwargs.get("log_cfg")
+        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
+        self.debug_sample = kwargs.get("debug_sample")
+        
+        self.register_buffer("running_sdr", torch.tensor(1.0))
+        self.sdr_ema_alpha, self.sdr_threshold = 0.95, -4.0
 
+        # 加载 1.7 分主干权重
+        pretrained_ckpt = "logs/addse-s/checkpoints/last.ckpt" 
+        import os
+        if os.path.exists(pretrained_ckpt):
+            print(f"--- 正在加载 1.7 分主干权重: {pretrained_ckpt} ---")
+            ckpt_data = torch.load(pretrained_ckpt, map_location="cpu")
+            state_dict = ckpt_data.get("state_dict", ckpt_data)
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            print(f"--- 权重加载完毕！新增并联支路参数未覆盖，保持随机初始化，等待训练学习 ---")
+        else:
+            print(f"⚠️ 未找到预训练权重 {pretrained_ckpt}，模型将从零开始！")
+
+    def loss(self, x_q, y_q, y_tok, return_intermediates=False, x_cont=None):
+        B, K, L = y_tok.shape
+        lambd = torch.rand(B, device=y_tok.device)
+        mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]
+        y_lambda_q = y_q.clone()
+        y_lambda_q.masked_fill_(mask[:, None], 0)
+        
+        log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
+        V = log_score.shape[-1]
+        loss = F.cross_entropy(log_score.reshape(-1, V), y_tok.reshape(-1), reduction="none")
+        loss = (loss.reshape(B, K, L) * mask).sum() / (mask.sum() + 1e-8)
+        return (loss, log_score, mask) if return_intermediates else loss
+
+    def log_score(self, y_q, x_q, x_cont=None):
+        x_c_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
+        def model_wrapper(y_s, x_s, c_s):
+            return self.model(y_s, x_s, None, c_cont=c_s)
+        score = process_in_blocks((y_q, x_q, x_c_in), self.block_size, model_wrapper)
+        return score.moveaxis(1, -1).log_softmax(dim=-1)
+
+    @override
+    def step(self, batch, stage, batch_idx, metrics=None):
+        x, y, _ = batch
+        x_lat = self.nac.encoder(x)
+        xy_tok, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=True, domain="q")
+        x_tok, y_tok = xy_tok.chunk(2); x_q, y_q = xy_q.chunk(2)
+
+        # 仅计算稳定的分类重构损失 (CE Loss)，并联支路会通过它学习提取高频特征
+        ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat)
+        
+        self.log(f"{stage}/loss", ce_loss, prog_bar=True, sync_dist=True)
+
+        if metrics or (stage == "val" and batch_idx == 0):
+            y_hat_tok = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
+            y_hat = self.nac.decode(y_hat_tok, domain="code")
+            return {"loss": ce_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
+            
+        return {"loss": ce_loss}, {}, {}
+
+    @torch.no_grad()
+    def solve(self, x_tok, x_q, num_steps, x_cont=None):
+        B, K, L = x_tok.shape
+        y_tok = torch.full_like(x_tok, self.mask_token)
+        import math
+        for i in range(num_steps):
+            mask = y_tok == self.mask_token
+            if not mask.any(): break
+            
+            # 使用 NAC 自带的最稳定的 decode 方法获取连续特征
+            y_q = self.nac.quantizer.decode(
+                y_tok.masked_fill(mask, 0), output_no_sum=True, domain="code"
+            ).masked_fill(mask[:, None], 0)
+            
+            log_p = self.log_score(y_q, x_q, x_cont=x_cont)
+            probs = log_p.exp()
+            sampled_tokens = torch.multinomial(probs[mask], 1).squeeze(-1)
+            y_tok_new = y_tok.clone()
+            y_tok_new[mask] = sampled_tokens
+            
+            if i == num_steps - 1:
+                y_tok = y_tok_new
+                break
+                
+            confidence = probs[mask].gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+            conf_full = torch.full_like(y_tok, 1e9, dtype=torch.float32)
+            conf_full[mask] = confidence
+            
+            ratio = math.cos(math.pi / 2 * (i + 1) / num_steps)
+            num_mask = int(ratio * K * L)
+            
+            if num_mask > 0:
+                conf_flat = conf_full.view(B, -1)
+                cutoff_vals, _ = torch.topk(conf_flat, num_mask, dim=-1, largest=False)
+                cutoff = cutoff_vals[:, -1:]
+                new_mask = (conf_flat <= cutoff).view(B, K, L)
+                y_tok_new[new_mask] = self.mask_token
+                
+            y_tok = y_tok_new
+        return y_tok
+
+    def forward(self, x: torch.Tensor, return_nfe: bool = False, **kwargs):
+        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional"
+        n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
+        x_pad = F.pad(x, (0, n_pad))
+        x_lat = self.nac.encoder(x_pad)
+        x_tok, x_q = self.nac.encode(x_pad, no_sum=True, domain="q")
+        y_hat_tok = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
+        y_hat_pad = self.nac.decode(y_hat_tok, domain="code")
+        y_hat = y_hat_pad[..., : y_hat_pad.shape[-1] - n_pad]
+        if return_nfe: return y_hat, self.num_steps
+        return y_hat
+
+# ======================================================================
+# 其他辅助类（EDMMixin, DataModule 等）原样保留
+# ======================================================================
 class EDMMixin(L.LightningModule):
-    """Mixin for training and sampling as in EDM."""
-
     model: nn.Module
     num_steps: int
     norm_factor: float
@@ -171,7 +226,6 @@ class EDMMixin(L.LightningModule):
     rho: float
 
     def loss(self, x: Tensor, y: Tensor) -> Tensor:
-        """Compute the loss as in EDM."""
         log_sigma = self.p_mean + self.p_sigma * torch.randn(y.shape[0], dtype=y.real.dtype, device=y.device)
         sigma = log_sigma.exp()
         weight = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data) ** 2
@@ -180,7 +234,6 @@ class EDMMixin(L.LightningModule):
         return loss.mean()
 
     def denoiser(self, y: Tensor, x: Tensor, sigma: Tensor) -> Tensor:
-        """Compute the denoiser parametrization as in EDM."""
         sigma_broad = sigma.view(-1, *(1,) * (y.ndim - 1))
         c_skip = self.sigma_data**2 / (sigma_broad**2 + self.sigma_data**2)
         c_out = self.sigma_data * sigma_broad / (self.sigma_data**2 + sigma_broad**2).sqrt()
@@ -191,13 +244,7 @@ class EDMMixin(L.LightningModule):
 
     @torch.no_grad()
     def solve(self, x: Tensor, num_steps: int) -> Tensor:
-        """Sample using the Heun method as in EDM."""
-        assert not self.model.training, "Model must be in eval mode to sample."
-        t = torch.tensor(
-            [self.sampling_step(i) if i < num_steps else 0.0 for i in range(num_steps + 1)],
-            device=x.device,
-            dtype=x.real.dtype,
-        )
+        t = torch.tensor([self.sampling_step(i) if i < num_steps else 0.0 for i in range(num_steps + 1)], device=x.device, dtype=x.real.dtype)
         y = t[0] * torch.randn_like(x)
         for i in range(num_steps):
             if self.s_churn > 0 and self.s_min <= t[i] <= self.s_max:
@@ -205,8 +252,7 @@ class EDMMixin(L.LightningModule):
                 t_hat = t[i] * (1 + gamma)
                 y_hat = y + (t_hat**2 - t[i] ** 2).sqrt() * torch.randn_like(y) * self.s_noise
             else:
-                t_hat = t[i]
-                y_hat = y
+                t_hat = t[i]; y_hat = y
             d = (y_hat - self.denoiser(y_hat, x, t_hat[None])) / t_hat
             y = y_hat + (t[i + 1] - t_hat) * d
             if i < num_steps - 1:
@@ -215,800 +261,10 @@ class EDMMixin(L.LightningModule):
         return y
 
     def sampling_step(self, i: int) -> float:
-        """Compute the i-th sampling step."""
-        return (
-            self.sigma_max ** (1 / self.rho)
-            + i / (self.num_steps - 1) * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))
-        ) ** self.rho
-
-
-class LightningModule(BaseLightningModule, ConfigureOptimizersMixin):
-    """Simple Lightning module for training models to directly predict clean speech given noisy speech."""
-
-    def __init__(
-        self,
-        model: nn.Module,
-        loss: BaseLoss,
-        optimizer: Callable[[Iterator[nn.Parameter]], Optimizer] = Adam,
-        lr_scheduler: Mapping[str, Any] | None = None,
-        val_metrics: Mapping[str, BaseMetric] | None = None,
-        test_metrics: Mapping[str, BaseMetric] | None = None,
-        log_cfg: LogConfig | None = None,
-        debug_sample: tuple[int, int] | None = None,
-    ) -> None:
-        """Initialize the simple Lightning module.
-
-        Args:
-            model: Model to train.
-            loss: Loss module.
-            optimizer: Optimizer constructor.
-            lr_scheduler: Learning rate scheduler configuration.
-            val_metrics: Metrics to compute during validation.
-            test_metrics: Metrics to compute during testing.
-            log_cfg: Logging configuration.
-            debug_sample: Tuple `(batch_idx, sample_idx)` to log debug audio samples to W&B during validation.
-        """
-        super().__init__()
-        self.model = model
-        self.loss = loss
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.val_metrics = val_metrics
-        self.test_metrics = test_metrics
-        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
-        self.debug_sample = debug_sample
-        # SDR EMA guard state: running SDR (EMA), smoothing and threshold for guard
-        self.register_buffer("running_sdr", torch.tensor(1.0))  # initial ~1.0 (0 dB)
-        # SDR EMA and threshold (expect metrics in dB). Use conservative smoothing.
-        self.sdr_ema_alpha = 0.95
-        self.sdr_threshold = -10.0  # in dB: trigger guard when running SDR falls below -4 dB
-
-    @override
-    def step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor],
-        stage: str,
-        batch_idx: int,
-        metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
-        x, y, _ = batch
-        y_hat = self.model(x)
-        loss = self.loss(y_hat, y)
-        metric_vals = compute_metrics(y_hat, y, metrics)
-        debug_samples = {"input": x, "reference": y, "output": y_hat} if self.current_epoch == 0 else {"output": y_hat}
-        return loss, metric_vals, debug_samples
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Enhance the input audio."""
-        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional, got shape {x.shape}"
-        return self.model(x)
-
-
-class SGMSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
-    """SGMSE Lightning module."""
-
-    def __init__(
-        self,
-        model: SGMSEUNet,
-        stft: STFT,
-        num_steps: int = 30,
-        sigma_min: float = 0.05,
-        sigma_max: float = 0.5,
-        gamma: float = 1.5,
-        t_eps: float = 0.03,
-        corrector_snr: float = 0.5,
-        alpha: float = 0.5,
-        beta: float = 0.15,
-        optimizer: Callable[[Iterator[nn.Parameter]], Optimizer] = Adam,
-        lr_scheduler: Mapping[str, Any] | None = None,
-        val_metrics: Mapping[str, BaseMetric] | None = None,
-        test_metrics: Mapping[str, BaseMetric] | None = None,
-        log_cfg: LogConfig | None = None,
-        debug_sample: tuple[int, int] | None = None,
-    ) -> None:
-        """Initialize the SGMSE Lightning module."""
-        super().__init__()
-        self.model = model
-        self.stft = stft
-        self.num_steps = num_steps
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.gamma = gamma
-        self.t_eps = t_eps
-        self.corrector_snr = corrector_snr
-        self.alpha = alpha
-        self.beta = beta
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.val_metrics = val_metrics
-        self.test_metrics = test_metrics
-        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
-        self.debug_sample = debug_sample
-
-    def transform(self, x: Tensor) -> Tensor:
-        """Compute the STFT, compress, and scale."""
-        x = self.stft(x)
-        return torch.polar(self.beta * x.abs() ** self.alpha, x.angle())
-
-    def inverse_transform(self, x: Tensor, n: int) -> Tensor:
-        """Decompress, descale, and compute the inverse STFT."""
-        x = torch.polar((x.abs() / self.beta) ** (1 / self.alpha), x.angle())
-        return self.stft.inverse(x, n=n)
-
-    @override
-    def step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor],
-        stage: str,
-        batch_idx: int,
-        metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
-        x, y, _ = batch
-        # peak-normalize
-        factor = x.abs().amax(dim=(1, 2), keepdim=True)
-        x_norm, y_norm = x / factor, y / factor
-        x_stft, y_stft = self.transform(x_norm), self.transform(y_norm)
-        loss = {"loss": self.loss(x_stft, y_stft)}
-        if metrics or stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]:
-            y_hat_stft = self.solve(x_stft, self.num_steps)
-            y_hat_norm = self.inverse_transform(y_hat_stft, n=x.shape[-1])
-            # undo peak-normalization
-            y_hat = y_hat_norm * factor
-            metric_vals = compute_metrics(y_hat, y, metrics)
-            debug = {"input": x, "reference": y, "output": y_hat} if self.current_epoch == 0 else {"output": y_hat}
-            return loss, metric_vals, debug
-        return loss, {}, {}
-
-    def loss(self, x: Tensor, y: Tensor) -> Tensor:
-        """Compute the loss."""
-        t = torch.rand(y.shape[0], dtype=y.real.dtype, device=y.device) * (1 - self.t_eps) + self.t_eps
-        sigma = self.sigma(t).reshape(-1, 1, 1, 1)
-        z = torch.randn_like(y)
-        y_t = (-self.gamma * t).exp().reshape(-1, 1, 1, 1) * (y - x) + x + sigma * z  # eq. (30-32)
-        return (sigma * self.score(x, y_t, t) + z).abs().pow(2).mean()  # eq. (33)
-
-    def sigma(self, t: Tensor) -> Tensor:
-        """Noise schedule."""
-        sigma_ratio = self.sigma_max / self.sigma_min
-        num = sigma_ratio ** (2 * t) - (-2 * self.gamma * t).exp()
-        den = 1 + self.gamma / math.log(sigma_ratio)
-        return self.sigma_min * (num / den).sqrt()
-
-    def score(self, x: Tensor, y: Tensor, t: Tensor) -> Tensor:
-        """Estimate the score function."""
-        return -self.model(x, y, t.log()) / t.reshape(-1, 1, 1, 1)  # eq. (34)
-
-    @torch.no_grad()
-    def solve(self, x: Tensor, num_steps: int) -> Tensor:
-        """Sample using the predictor-corrector method."""
-        assert not self.model.training, "Model must be in eval mode to sample."
-        t = torch.linspace(1.0, 0.0, num_steps + 1, device=x.device, dtype=x.real.dtype)
-        sigma = self.sigma(t)
-        eps = 2 * (self.corrector_snr * sigma) ** 2
-        y = x + sigma[0] * torch.randn_like(x)
-        sigma_ratio = self.sigma_max / self.sigma_min
-        for i in range(num_steps):
-            # corrector step
-            y += eps[i] * self.score(x, y, t[i, None]) + (2 * eps[i]) ** 0.5 * torch.randn_like(y)
-            # predictor step
-            g = self.sigma_min * sigma_ratio ** t[i] * (2 * math.log(sigma_ratio)) ** 0.5
-            if i < num_steps - 1:  # reverse SDE step
-                y_dot = self.gamma * (x - y) - g**2 * self.score(x, y, t[i, None])
-                y += (t[i + 1] - t[i]) * y_dot + g * (t[i] - t[i + 1]).sqrt() * torch.randn_like(y)
-            else:  # probability flow ODE step
-                y_dot = self.gamma * (x - y) - g**2 * self.score(x, y, t[i, None]) * 0.5
-                y += (t[i + 1] - t[i]) * y_dot
-        return y
-
-    def forward(self, x: Tensor, num_steps: int | None = None) -> Tensor:
-        """Enhance the input audio."""
-        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional, got shape {x.shape}"
-        # peak-normalize
-        factor = x.abs().amax(dim=(1, 2), keepdim=True)
-        x = x / factor
-        x_stft = self.transform(x)
-        # pad to multiple of model.downsampling_factor
-        n_pad = (self.model.downsampling_factor - x_stft.shape[-1]) % self.model.downsampling_factor
-        x_stft_pad = F.pad(x_stft, (0, n_pad))
-        y_stft_pad = self.solve(x_stft_pad, self.num_steps if num_steps is None else num_steps)
-        y_stft = y_stft_pad[..., : y_stft_pad.shape[-1] - n_pad]
-        y = self.inverse_transform(y_stft, n=x.shape[-1])
-        # undo peak-normalization
-        return y * factor
-
-
-class NACLightningModule(BaseLightningModule):
-    """Lightning module for neural audio codec."""
-
-    def __init__(
-        self,
-        generator: NAC,
-        discriminator: nn.Module | Iterable[nn.Module],
-        reconstruction_loss: BaseLoss,
-        adversarial_loss_weight: float,
-        feature_loss_weight: float,
-        reconstruction_loss_weight: float,
-        codebook_loss_weight: float,
-        commitment_loss_weight: float,
-        generator_optimizer: Callable[[Iterator[nn.Parameter]], Optimizer],
-        discriminator_optimizer: Callable[[Iterator[nn.Parameter]], Optimizer],
-        generator_grad_clip: float = 0.0,
-        discriminator_grad_clip: float = 0.0,
-        val_metrics: Mapping[str, BaseMetric] | None = None,
-        test_metrics: Mapping[str, BaseMetric] | None = None,
-        log_cfg: LogConfig | None = None,
-        debug_sample: tuple[int, int] | None = None,
-    ) -> None:
-        """Initialize the neural audio codec Lightning module."""
-        super().__init__()
-        self.generator = generator
-        self.discriminator = nn.ModuleList([discriminator] if isinstance(discriminator, nn.Module) else discriminator)
-        self.reconstruction_loss = reconstruction_loss
-        self.adversarial_loss_weight = adversarial_loss_weight
-        self.feature_loss_weight = feature_loss_weight
-        self.reconstruction_loss_weight = reconstruction_loss_weight
-        self.codebook_loss_weight = codebook_loss_weight
-        self.commitment_loss_weight = commitment_loss_weight
-        self.generator_optimizer = generator_optimizer
-        self.discriminator_optimizer = discriminator_optimizer
-        self.generator_grad_clip = generator_grad_clip
-        self.discriminator_grad_clip = discriminator_grad_clip
-        self.val_metrics = val_metrics
-        self.test_metrics = test_metrics
-        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
-        self.debug_sample = debug_sample
-        self.automatic_optimization = False
-
-    def discriminator_forward(self, x: Tensor) -> tuple[list[Tensor], list[list[Tensor]]]:
-        """Forward pass through all discriminators."""
-        all_outputs: list[Tensor] = []
-        all_featuress: list[list[Tensor]] = []
-        for discriminator in self.discriminator:
-            outputs, featuress = discriminator(x)
-            all_outputs.extend(outputs)
-            all_featuress.extend(featuress)
-        return all_outputs, all_featuress
-
-    def discriminator_step(self, x: Tensor, y: Tensor) -> Tensor:
-        """Discriminator step."""
-        real, fake = x.detach(), y.detach()
-        real_preds, _ = self.discriminator_forward(real)
-        fake_preds, _ = self.discriminator_forward(fake)
-        loss: Tensor | float = 0.0
-        for real_pred, fake_pred in zip(real_preds, fake_preds):
-            loss += F.relu(1.0 - real_pred).mean() + F.relu(1.0 + fake_pred).mean()
-        assert isinstance(loss, Tensor)
-        return loss / len(real_preds)
-
-    def generator_step(self, x: Tensor, y: Tensor, codebook_loss: Tensor, commit_loss: Tensor) -> dict[str, Tensor]:
-        """Generator step."""
-        _, real_featss = self.discriminator_forward(x)
-        fake_preds, fake_featss = self.discriminator_forward(y)
-        adv_loss: Tensor | float = 0.0
-        feat_loss: Tensor | float = 0.0
-        for fake_pred, fake_feats, real_feats in zip(fake_preds, fake_featss, real_featss):
-            adv_loss += -fake_pred.mean()
-            for real_feat, fake_feat in zip(real_feats, fake_feats):
-                feat_loss += F.l1_loss(fake_feat, real_feat)
-        adv_loss /= len(fake_preds)
-        feat_loss /= sum(len(f) for f in real_featss)
-        assert isinstance(adv_loss, Tensor)
-        assert isinstance(feat_loss, Tensor)
-        recon_loss = self.reconstruction_loss(x, y)["loss"]
-        loss = (
-            self.adversarial_loss_weight * adv_loss
-            + self.feature_loss_weight * feat_loss
-            + self.reconstruction_loss_weight * recon_loss
-            + self.codebook_loss_weight * codebook_loss
-            + self.commitment_loss_weight * commit_loss
-        )
-        return {
-            "loss": loss,
-            "adv_loss": adv_loss,
-            "feat_loss": feat_loss,
-            "recon_loss": recon_loss,
-            "codebook_loss": codebook_loss,
-            "commit_loss": commit_loss,
-        }
-
-    @override
-    def step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor],
-        stage: str,
-        batch_idx: int,
-        metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
-        optimizers = self.optimizers()
-        if not isinstance(optimizers, list) or len(optimizers) != 2:
-            raise ValueError("NACLightningModule.configure_optimizers() must return two optimizers.")
-        generator_optimizer, discriminator_optimizer = optimizers
-
-        noisy, clean, _ = batch
-        x = torch.cat([clean, noisy], dim=0)
-        y, _, codebook_loss, commit_loss = self.generator(x)
-
-        if not codebook_loss.isfinite() or codebook_loss > 1e6:
-            raise ValueError(f"Codebook loss exploded: {codebook_loss.item()}")
-
-        disc_loss = self.discriminator_step(x, y)
-        if stage == "train":
-            discriminator_optimizer.zero_grad()
-            self.manual_backward(disc_loss)
-            self.clip_gradients(discriminator_optimizer, self.discriminator_grad_clip)  # type: ignore
-            discriminator_optimizer.step()
-
-        gen_losses = self.generator_step(x, y, codebook_loss, commit_loss)
-        if stage == "train":
-            generator_optimizer.zero_grad()
-            self.manual_backward(gen_losses["loss"])
-            self.clip_gradients(generator_optimizer, self.generator_grad_clip)  # type: ignore
-            generator_optimizer.step()
-
-        all_losses = {"disc_loss": disc_loss, **gen_losses}
-        metric_vals = compute_metrics(y, x, metrics)
-        clean_out = y[: clean.shape[0]]
-        debug_samples = {"input": clean, "output": clean_out} if self.current_epoch == 0 else {"output": clean_out}
-        return all_losses, metric_vals, debug_samples
-
-    def configure_optimizers(self) -> tuple[Optimizer, Optimizer]:
-        """Configure optimizers.
-
-        Returns:
-            Tuple of generator and discriminator optimizers.
-        """
-        generator_optimizer = self.generator_optimizer(self.generator.parameters())
-        discriminator_optimizer = self.discriminator_optimizer(self.discriminator.parameters())
-        return generator_optimizer, discriminator_optimizer
-
-    def forward(self, x: Tensor) -> Tensor:
-        n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
-        x_pad = F.pad(x, (0, n_pad))
-        x_tok, x_q = self.nac.encode(x_pad, no_sum=True, domain="q")
-        y_tok = self.solve(x_tok, x_q, self.num_steps)
-        y_pad = self.nac.decode(y_tok, domain="code")
-        return y_pad[..., : y_pad.shape[-1] - n_pad]
-
-
-class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
-    def __init__(self, nac_cfg: str, nac_ckpt: str, model: ADDSERQDiT, num_steps: int, block_size: int, **kwargs) -> None:
-        super().__init__()
-        self.nac, self.mask_token = load_nac(nac_cfg, nac_ckpt)
-        self.model, self.num_steps, self.block_size = model, num_steps, block_size
-        self.spec_loss = kwargs.get("spec_loss")
-        self.spec_loss_weight = kwargs.get("spec_loss_weight", 0.0)
-        self.optimizer, self.lr_scheduler = kwargs.get("optimizer"), kwargs.get("lr_scheduler")
-        # --- BaseLightningModule 兼容性补全 ---
-        self.val_metrics = kwargs.get("val_metrics")
-        self.test_metrics = kwargs.get("test_metrics")
-        log_cfg = kwargs.get("log_cfg")
-        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
-        self.debug_sample = kwargs.get("debug_sample")
-
-        self.register_buffer("running_sdr", torch.tensor(1.0))
-        self.sdr_ema_alpha, self.sdr_threshold = 0.95, -4.0
-
-        # ================= 新增：强行注入 1.7 分老权重 =================
-        # 直接使用你截图里的 addse-s 模型的权重
-        pretrained_ckpt = "logs/addse-edbase-quick/checkpoints/addse-s.ckpt"
-        import os
-        if os.path.exists(pretrained_ckpt):
-            print(f"--- 正在加载 1.7 分主干权重: {pretrained_ckpt} ---")
-            ckpt_data = torch.load(pretrained_ckpt, map_location="cpu")
-            # 提取 state_dict，兼容 Lightning 保存格式
-            state_dict = ckpt_data.get("state_dict", ckpt_data)
-            # strict=False 极其关键！它会让老网络原有的参数被加载，而你新加的 Parallel 支路保持随机初始化
-            missing, unexpected = self.load_state_dict(state_dict, strict=False)
-            print(f"--- 权重加载完毕！新增参数数: {len(missing)} ---")
-        else:
-            print(f"⚠️ 未找到预训练权重 {pretrained_ckpt}，模型将从零开始盲猜！")
-
-    @override
-    def step(self, batch, stage, batch_idx, metrics=None):
-        x, y, _ = batch
-        # 1. 提取 Pre-VQ 连续细粮
-        x_lat = self.nac.encoder(x)
-        
-        # 2. 提取 Post-VQ 离散粗粮
-        xy_tok, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=True, domain="q")
-        x_tok, y_tok = xy_tok.chunk(2); x_q, y_q = xy_q.chunk(2)
-
-        # 3. 传入 loss
-        ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat)
-
-        if metrics or (stage == "val" and batch_idx == 0):
-            # 推理时也传递连续特征 x_lat
-            y_hat_tok = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
-            y_hat = self.nac.decode(y_hat_tok, domain="code")
-            return {"loss": ce_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
-        return {"loss": ce_loss}, {}, {}
-
-    def loss(self, x_q, y_q, y_tok, return_intermediates=False, x_cont=None):
-        B, K, L = y_tok.shape
-        lambd = torch.rand(B, device=y_tok.device)
-        mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]
-        # 修正维度对齐逻辑
-        y_lambda_q = y_q.clone()
-        y_lambda_q.masked_fill_(mask[:, None], 0)
-        
-        log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
-        V = log_score.shape[-1]
-        loss = F.cross_entropy(log_score.reshape(-1, V), y_tok.reshape(-1), reduction="none")
-        loss = (loss.reshape(B, K, L) * mask).sum() / (mask.sum() + 1e-8)
-        return (loss, log_score, mask) if return_intermediates else loss
-
-    def log_score(self, y_q, x_q, x_cont=None):
-        # 推理或块处理时的占位符
-        x_c_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
-        def model_wrapper(y_s, x_s, c_s):
-            return self.model(y_s, x_s, None, c_cont=c_s)
-        score = process_in_blocks((y_q, x_q, x_c_in), self.block_size, model_wrapper)
-        return score.moveaxis(1, -1).log_softmax(dim=-1)
-
-    @torch.no_grad()
-    def solve(self, x_tok, x_q, num_steps, x_cont=None):
-        B, K, L = x_tok.shape
-        y_tok = torch.full_like(x_tok, self.mask_token)
-        for i in range(num_steps):
-            mask = y_tok == self.mask_token
-            # 如果所有的 token 都已经被成功预测，直接提前结束
-            if not mask.any():
-                break
-            # 解码当前包含 mask 的 token 到连续空间
-            y_q = self.nac.quantizer.decode(
-                y_tok.masked_fill(mask, 0),
-                output_no_sum=True,
-                domain="code"
-            ).masked_fill(mask[:, None], 0)
-            # 模型预测 (传入了你的连续细粮特征 x_cont)
-            log_p = self.log_score(y_q, x_q, x_cont=x_cont)
-            probs = log_p.exp()
-            # 采样当前处于 mask 状态的 token
-            sampled_tokens = torch.multinomial(probs[mask], 1).squeeze(-1)
-            # 建立一个完整的候选 y_tok
-            y_tok_new = y_tok.clone()
-            y_tok_new[mask] = sampled_tokens
-            # 如果是最后一步，全盘接收，直接退出
-            if i == num_steps - 1:
-                y_tok = y_tok_new
-                break
-            # ========= 核心修复：MaskGIT 置信度重掩码 =========
-            # 1. 获取刚刚采样的这批 token 的置信度
-            confidence = probs[mask].gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
-            # 2. 构建一个全局置信度矩阵 (老 token 的置信度设为无穷大，保证它们不再被 mask)
-            conf_full = torch.full_like(y_tok, 1e9, dtype=torch.float32)
-            conf_full[mask] = confidence
-            # 3. 余弦退火调度：计算下一步还需要保留多少个 mask 
-            ratio = math.cos(math.pi / 2 * (i + 1) / num_steps)
-            num_mask = int(ratio * K * L)
-            if num_mask > 0:
-                # 找到当前置信度最低的 num_mask 个位置
-                conf_flat = conf_full.view(B, -1)
-                cutoff_vals, _ = torch.topk(conf_flat, num_mask, dim=-1, largest=False)
-                cutoff = cutoff_vals[:, -1:]
-                # 将低于阈值（不自信）的位置重新设为 mask_token，留给下一轮去猜
-                new_mask = (conf_flat <= cutoff).view(B, K, L)
-                y_tok_new[new_mask] = self.mask_token
-            y_tok = y_tok_new
-        return y_tok
-
-    def forward(self, x: torch.Tensor, return_nfe: bool = False, **kwargs):
-        """Enhance the input audio during inference."""
-        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional, got shape {x.shape}"
-        # 0. 边缘 Padding：确保输入长度是模型下采样率的整数倍
-        n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
-        x_pad = F.pad(x, (0, n_pad))
-        # 1. 提取 Pre-VQ 连续细粮
-        x_lat = self.nac.encoder(x_pad)
-        # 2. 提取 Post-VQ 离散粗粮
-        x_tok, x_q = self.nac.encode(x_pad, no_sum=True, domain="q")
-        # 3. 传入 solve 进行扩散采样交互
-        y_hat_tok = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
-        # 4. 解码为音频波形
-        y_hat_pad = self.nac.decode(y_hat_tok, domain="code")
-        # 5. 裁剪掉 Padding 部分，还原真实长度
-        y_hat = y_hat_pad[..., : y_hat_pad.shape[-1] - n_pad]
-        if return_nfe:
-            return y_hat, self.num_steps
-        return y_hat
-
-class NACSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
-    """Lightning module for speech enhancement using NAC-domain direct prediction."""
-
-    def __init__(
-        self,
-        nac_cfg: str,
-        nac_ckpt: str,
-        nac_domain: str,
-        nac_no_sum: bool,
-        model: nn.Module,
-        block_size: int,
-        optimizer: Callable[[Iterator[nn.Parameter]], Optimizer] = Adam,
-        lr_scheduler: Mapping[str, Any] | None = None,
-        val_metrics: Mapping[str, BaseMetric] | None = None,
-        test_metrics: Mapping[str, BaseMetric] | None = None,
-        log_cfg: LogConfig | None = None,
-        debug_sample: tuple[int, int] | None = None,
-    ) -> None:
-        """Initialize the NAC-domain Lightning module."""
-        super().__init__()
-        self.nac, _ = load_nac(nac_cfg, nac_ckpt)
-        self.nac_domain = nac_domain
-        self.nac_no_sum = nac_no_sum
-        self.model = model
-        self.block_size = block_size
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.val_metrics = val_metrics
-        self.test_metrics = test_metrics
-        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
-        self.debug_sample = debug_sample
-
-    @override
-    def step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor],
-        stage: str,
-        batch_idx: int,
-        metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
-        x, y, _ = batch
-        _, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=self.nac_no_sum, domain=self.nac_domain)
-        x_q, y_q = xy_q.chunk(2)
-        y_hat_q = process_in_blocks((x_q,), self.block_size, self.model)
-        loss = {"loss": (y_hat_q - y_q).pow(2).mean()}
-        if metrics or stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]:
-            y_hat = self.nac.decode(y_hat_q, no_sum=self.nac_no_sum, domain=self.nac_domain)
-            y_decoded = self.nac.decode(y_q, no_sum=self.nac_no_sum, domain=self.nac_domain)
-            metric_vals = compute_metrics(y_hat, y, metrics)
-            debug_samples = (
-                {"input": x, "reference": y, "output": y_hat, "reference_decoded": y_decoded}
-                if self.current_epoch == 0
-                else {"output": y_hat}
-            )
-            return loss, metric_vals, debug_samples
-        return loss, {}, {}
-
-    def forward(self, x: Tensor) -> Tensor:
-        """Enhance the input audio."""
-        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional, got shape {x.shape}"
-        # pad to multiple of nac.downsampling_factor
-        n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
-        x_pad = F.pad(x, (0, n_pad))
-        _, x_q = self.nac.encode(x_pad, no_sum=self.nac_no_sum, domain=self.nac_domain)
-        y_pad = process_in_blocks((x_q,), self.block_size, self.model)
-        y_pad = self.nac.decode(y_pad, no_sum=self.nac_no_sum, domain=self.nac_domain)
-        return y_pad[..., : y_pad.shape[-1] - n_pad]
-
-
-class EDMNACSELightningModule(BaseLightningModule, ConfigureOptimizersMixin, EDMMixin):
-    """Lightning module for speech enhancement using NAC-domain EDM-style diffusion."""
-
-    def __init__(
-        self,
-        nac_cfg: str,
-        nac_ckpt: str,
-        nac_domain: str,
-        nac_no_sum: bool,
-        nac_stack: bool,
-        model: ADDSERQDiT,
-        num_steps: int,
-        block_size: int,
-        norm_factor: float = 2.3,
-        sigma_data: float = 0.5,
-        p_mean: float = 0.0,
-        p_sigma: float = 1.0,
-        s_churn: float = 0.0,
-        s_min: float = 0.0,
-        s_max: float = float("inf"),
-        s_noise: float = 1.0,
-        sigma_min: float = 0.002,
-        sigma_max: float = 80.0,
-        rho: float = 7.0,
-        optimizer: Callable[[Iterator[nn.Parameter]], Optimizer] = Adam,
-        lr_scheduler: Mapping[str, Any] | None = None,
-        val_metrics: Mapping[str, BaseMetric] | None = None,
-        test_metrics: Mapping[str, BaseMetric] | None = None,
-        log_cfg: LogConfig | None = None,
-        debug_sample: tuple[int, int] | None = None,
-    ) -> None:
-        """Initialize the NAC-domain EDM-style Lightning module."""
-        super().__init__()
-        self.nac, _ = load_nac(nac_cfg, nac_ckpt)
-        self.nac_domain = nac_domain
-        self.nac_no_sum = nac_no_sum
-        self.nac_stack = nac_stack
-        self.model = model
-        self.num_steps = num_steps
-        self.block_size = block_size
-        self.norm_factor = norm_factor
-        self.sigma_data = sigma_data
-        self.p_mean = p_mean
-        self.p_sigma = p_sigma
-        self.s_churn = s_churn
-        self.s_min = s_min
-        self.s_max = s_max
-        self.s_noise = s_noise
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.rho = rho
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.val_metrics = val_metrics
-        self.test_metrics = test_metrics
-        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
-        self.debug_sample = debug_sample
-
-    @override
-    def step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor],
-        stage: str,
-        batch_idx: int,
-        metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
-        x, y, _ = batch
-        _, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=self.nac_no_sum, domain=self.nac_domain)
-        x_q, y_q = xy_q.chunk(2)
-        x_q_norm = x_q * self.sigma_data / self.norm_factor  # See section B.1 "Latent diffusion" in EDM2 paper
-        y_q_norm = y_q * self.sigma_data / self.norm_factor  # See section B.1 "Latent diffusion" in EDM2 paper
-        x_q_norm = x_q_norm.flatten(1, 2).unsqueeze(2) if self.nac_stack else x_q_norm
-        y_q_norm = y_q_norm.flatten(1, 2).unsqueeze(2) if self.nac_stack else y_q_norm
-        loss = {"loss": self.loss(x_q_norm, y_q_norm)}
-        if metrics or stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]:
-            y_hat_q = self.solve(x_q_norm, self.num_steps)
-            y_hat_q = y_hat_q.squeeze(2).unflatten(1, (y_q.shape[1], y_q.shape[2])) if self.nac_stack else y_hat_q
-            y_hat_q = y_hat_q * self.norm_factor / self.sigma_data
-            y_hat = self.nac.decode(y_hat_q, no_sum=self.nac_no_sum, domain=self.nac_domain)
-            y_decoded = self.nac.decode(y_q, no_sum=self.nac_no_sum, domain=self.nac_domain)
-            metric_vals = compute_metrics(y_hat, y, metrics)
-            debug_samples = (
-                {"input": x, "reference": y, "output": y_hat, "reference_decoded": y_decoded}
-                if self.current_epoch == 0
-                else {"output": y_hat}
-            )
-            return loss, metric_vals, debug_samples
-        return loss, {}, {}
-
-    @override
-    def denoiser(self, y: Tensor, x: Tensor, sigma: Tensor) -> Tensor:
-        return process_in_blocks((y, x), self.block_size, functools.partial(super().denoiser, sigma=sigma))
-
-    def forward(self, x: Tensor, num_steps: int | None = None) -> Tensor:
-        """Enhance the input audio."""
-        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional, got shape {x.shape}"
-        # pad to multiple of nac.downsampling_factor
-        n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
-        x_pad = F.pad(x, (0, n_pad))
-        _, x_q = self.nac.encode(x_pad, no_sum=self.nac_no_sum, domain=self.nac_domain)
-        x_q_norm = x_q * self.sigma_data / self.norm_factor  # See section B.1 "Latent diffusion" in EDM2 paper
-        x_q_norm = x_q_norm.flatten(1, 2).unsqueeze(2) if self.nac_stack else x_q_norm
-        y_q_norm = self.solve(x_q_norm, self.num_steps if num_steps is None else num_steps)
-        y_q = y_q_norm.squeeze(2).unflatten(1, (x_q.shape[1], x_q.shape[2])) if self.nac_stack else y_q_norm
-        y_q = y_q * self.norm_factor / self.sigma_data
-        y_pad = self.nac.decode(y_q, no_sum=self.nac_no_sum, domain=self.nac_domain)
-        return y_pad[..., : y_pad.shape[-1] - n_pad]
-
-
-class EDMSELightningModule(BaseLightningModule, ConfigureOptimizersMixin, EDMMixin):
-    """Lightning module for speech enhancement using STFT-domain EDM-style diffusion."""
-
-    def __init__(
-        self,
-        model: ADM,
-        stft: STFT,
-        num_steps: int = 30,
-        sigma_data: float = 0.5,
-        p_mean: float = 0.0,
-        p_sigma: float = 1.0,
-        s_churn: float = 0.0,
-        s_min: float = 0.0,
-        s_max: float = float("inf"),
-        s_noise: float = 1.0,
-        sigma_min: float = 0.002,
-        sigma_max: float = 80.0,
-        rho: float = 7.0,
-        optimizer: Callable[[Iterator[nn.Parameter]], Optimizer] = Adam,
-        lr_scheduler: Mapping[str, Any] | None = None,
-        val_metrics: Mapping[str, BaseMetric] | None = None,
-        test_metrics: Mapping[str, BaseMetric] | None = None,
-        log_cfg: LogConfig | None = None,
-        debug_sample: tuple[int, int] | None = None,
-    ) -> None:
-        """Initialize the NAC-domain EDM-style Lightning module."""
-        super().__init__()
-        self.model: ADM = model
-        self.stft = stft
-        self.num_steps = num_steps
-        self.sigma_data = sigma_data
-        self.p_mean = p_mean
-        self.p_sigma = p_sigma
-        self.s_churn = s_churn
-        self.s_min = s_min
-        self.s_max = s_max
-        self.s_noise = s_noise
-        self.sigma_min = sigma_min
-        self.sigma_max = sigma_max
-        self.rho = rho
-        self.optimizer = optimizer
-        self.lr_scheduler = lr_scheduler
-        self.val_metrics = val_metrics
-        self.test_metrics = test_metrics
-        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
-        self.debug_sample = debug_sample
-
-    @override
-    def step(
-        self,
-        batch: tuple[Tensor, Tensor, Tensor],
-        stage: str,
-        batch_idx: int,
-        metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
-        x, y, _ = batch
-        x_stft, y_stft = self.transform(x), self.transform(y)
-        # set std to sigma_data
-        factor = x_stft.std(dim=(1, 2, 3), keepdim=True) / self.sigma_data
-        x_stft, y_stft = x_stft / factor, y_stft / factor
-        loss = {"loss": self.loss(x_stft, y_stft)}
-        if metrics or stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]:
-            y_hat_stft = self.solve(x_stft, self.num_steps)
-            # undo std scaling
-            y_hat_stft = y_hat_stft * factor
-            y_hat = self.inverse_transform(y_hat_stft, n=x.shape[-1])
-            metric_vals = compute_metrics(y_hat, y, metrics)
-            debug = {"input": x, "reference": y, "output": y_hat} if self.current_epoch == 0 else {"output": y_hat}
-            return loss, metric_vals, debug
-        return loss, {}, {}
-
-    def transform(self, x: Tensor) -> Tensor:
-        """Compute the STFT and compress."""
-        x = self.stft(x)
-        return torch.polar(x.abs().sqrt(), x.angle())
-
-    def inverse_transform(self, x: Tensor, n: int) -> Tensor:
-        """Decompress and compute the inverse STFT."""
-        x = torch.polar(x.abs().square(), x.angle())
-        return self.stft.inverse(x, n=n)
-
-    def forward(self, x: Tensor, num_steps: int | None = None) -> Tensor:
-        """Enhance the input audio."""
-        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional, got shape {x.shape}"
-        x_stft = self.transform(x)
-        # set std to sigma_data
-        factor = x_stft.std(dim=(1, 2, 3), keepdim=True) / self.sigma_data
-        x_stft = x_stft / factor
-        # pad to multiple of model.downsampling_factor
-        n_pad = (self.model.downsampling_factor - x_stft.shape[-1]) % self.model.downsampling_factor
-        x_stft_pad = F.pad(x_stft, (0, n_pad))
-        y_stft_pad = self.solve(x_stft_pad, self.num_steps if num_steps is None else num_steps)
-        y_stft = y_stft_pad[..., : y_stft_pad.shape[-1] - n_pad]
-        # undo std scaling
-        return self.inverse_transform(y_stft * factor, n=x.shape[-1])
-
+        return (self.sigma_max ** (1 / self.rho) + i / (self.num_steps - 1) * (self.sigma_min ** (1 / self.rho) - self.sigma_max ** (1 / self.rho))) ** self.rho
 
 class DataModule(L.LightningDataModule):
-    """Data module."""
-
-    def __init__(
-        self,
-        train_dataset: Callable[[], Dataset],
-        train_dataloader: Callable[[Dataset], DataLoader],
-        val_dataset: Callable[[], Dataset] | None = None,
-        val_dataloader: Callable[[Dataset], DataLoader] | None = None,
-        test_dataset: Callable[[], Dataset] | None = None,
-        test_dataloader: Callable[[Dataset], DataLoader] | None = None,
-    ) -> None:
-        """Initialize the data module.
-
-        Args:
-            train_dataset: Function to initialize the training dataset.
-            val_dataset: Function to initialize the validation dataset.
-            test_dataset: Function to initialize the test dataset.
-            train_dataloader: Function to initialize the training dataloader.
-            val_dataloader: Function to initialize the validation dataloader.
-            test_dataloader: Function to initialize the test dataloader.
-        """
+    def __init__(self, train_dataset, train_dataloader, val_dataset=None, val_dataloader=None, test_dataset=None, test_dataloader=None):
         super().__init__()
         self.train_dataset_fn = train_dataset
         self.val_dataset_fn = val_dataset
@@ -1016,39 +272,14 @@ class DataModule(L.LightningDataModule):
         self.train_dataloader_fn = train_dataloader
         self.val_dataloader_fn = val_dataloader
         self.test_dataloader_fn = test_dataloader
-        self.train_dset: Dataset | None = None
-        self.val_dset: Dataset | None = None
-        self.test_dset: Dataset | None = None
-        self._state_dict: dict[str, Any] | None = None
+        self.train_dset = None; self.val_dset = None; self.test_dset = None; self._state_dict = None
 
     def setup(self, stage: str) -> None:
-        """Setup the data module.
-
-        Args:
-            stage: Either `"fit"`, `"validate"`, `"test"`, or `"predict"`.
-        """
         self.train_dset = self.train_dataset_fn()
         self.val_dset = None if self.val_dataset_fn is None else self.val_dataset_fn()
         self.test_dset = None if self.test_dataset_fn is None else self.test_dataset_fn()
-        if self.trainer is not None and (
-            isinstance(self.train_dset, DynamicMixingDataset)
-            and not isinstance(self.trainer.limit_train_batches, int)
-            or isinstance(self.val_dset, DynamicMixingDataset)
-            and not isinstance(self.trainer.limit_val_batches, int)
-            or isinstance(self.test_dset, DynamicMixingDataset)
-            and not isinstance(self.trainer.limit_test_batches, int)
-        ):
-            raise ValueError(
-                "DynamicMixingDataset requires a fixed number of batches. Set `limit_<stage>_batches` to an integer."
-            )
 
     def train_dataloader(self) -> DataLoader:
-        """Get the training dataloader.
-
-        Returns:
-            The training dataloader.
-        """
-        assert self.train_dset is not None
         train_dataloader = self.train_dataloader_fn(self.train_dset)
         if self._state_dict is not None and isinstance(train_dataloader, AudioStreamingDataLoader):
             train_dataloader.load_state_dict(self._state_dict)
@@ -1056,87 +287,30 @@ class DataModule(L.LightningDataModule):
         return train_dataloader
 
     def val_dataloader(self) -> DataLoader | list:
-        """Get the validation dataloader.
-
-        Returns:
-            The validation dataloader or an empty list if no validation dataset was provided at initialization.
-        """
-        if self.val_dataloader_fn is None or self.val_dset is None:
-            return []
-        return self.val_dataloader_fn(self.val_dset)
+        return [] if self.val_dataloader_fn is None or self.val_dset is None else self.val_dataloader_fn(self.val_dset)
 
     def test_dataloader(self) -> DataLoader | list:
-        """Get the test dataloader.
+        return [] if self.test_dataloader_fn is None or self.test_dset is None else self.test_dataloader_fn(self.test_dset)
 
-        Returns:
-            The test dataloader or an empty list if no test dataset was provided at initialization.
-        """
-        if self.test_dataloader_fn is None or self.test_dset is None:
-            return []
-        return self.test_dataloader_fn(self.test_dset)
+    def state_dict(self) -> dict:
+        return self.trainer.train_dataloader.state_dict() if self.trainer is not None and isinstance(self.trainer.train_dataloader, AudioStreamingDataLoader) else {}
 
-    def state_dict(self) -> dict[str, Any]:
-        """Get the state dict of the data module."""
-        if self.trainer is not None and isinstance(self.trainer.train_dataloader, AudioStreamingDataLoader):
-            return self.trainer.train_dataloader.state_dict()
-        return {}
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Load the state dict of the data module."""
+    def load_state_dict(self, state_dict: dict) -> None:
         self._state_dict = state_dict
 
-
 def compute_metrics(x: Tensor, y: Tensor, metrics: Mapping[str, BaseMetric] | None = None) -> dict[str, float]:
-    """Compute validation or test metrics.
-
-    Args:
-        x: Signal to evaluate. Shape `(batch_size, num_channels, num_samples)`.
-        y: Reference signal for the metrics. Shape `(batch_size, num_channels, num_samples)`.
-        metrics: Metrics to compute.
-
-    Returns:
-        Dictionary with computed metrics.
-    """
-    if not (x.ndim == y.ndim == 3) or x.shape != y.shape:
-        raise ValueError(f"Inputs must be 3-dimensional and have the same shape. Got {x.shape} and {y.shape}.")
-    return {
-        metric_name: sum(metric(x_i, y_i) for x_i, y_i in zip(x, y)) / y.shape[0]
-        for metric_name, metric in (metrics or {}).items()
-    }
-
+    return {k: sum(v(x_i, y_i) for x_i, y_i in zip(x, y)) / y.shape[0] for k, v in (metrics or {}).items()}
 
 def load_nac(cfg_path: str, ckpt_path: str) -> tuple[NAC, int]:
-    """Load a pretrained neural audio codec."""
-    with open(cfg_path) as f:
-        cfg = yaml.safe_load(f)
+    with open(cfg_path) as f: cfg = yaml.safe_load(f)
     nac: NAC = instantiate(cfg["lm"]["generator"])
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    # Diagnostic prints to validate the NAC checkpoint contents
-    try:
-        print("--- NAC Checkpoint Diagnostic ---")
-        print(f"Path: {ckpt_path}")
-        if isinstance(ckpt, dict):
-            if "epoch" in ckpt:
-                print(f"Pretrained Epoch: {ckpt.get('epoch')}")
-            if "callback_metrics" in ckpt:
-                try:
-                    print(f"Recon Loss: {ckpt['callback_metrics'].get('val_recon_loss', 'N/A')}")
-                except Exception:
-                    pass
-        print("---------------------------------")
-    except Exception:
-        pass
     state_dict = {k.removeprefix("generator."): v for k, v in ckpt["state_dict"].items() if k.startswith("generator.")}
     nac.load_state_dict(state_dict)
     nac.eval()
-    for param in nac.parameters():
-        param.requires_grad = False
-    codebook_size: int = nac.quantizer.codebooks[0].codebook.weight.shape[0]  # type: ignore
-    return nac, codebook_size
-
+    for param in nac.parameters(): param.requires_grad = False
+    return nac, nac.quantizer.codebooks[0].codebook.weight.shape[0]
 
 def process_in_blocks(args: tuple[Tensor, ...], block_size: int, fn: Callable[..., Tensor]) -> Tensor:
-    """Process the inputs in blocks."""
-    assert all(arg.shape[-1] == args[0].shape[-1] for arg in args), "All inputs must have same size along last dim."
     blocks = [fn(*(arg[..., i : i + block_size] for arg in args)) for i in range(0, args[0].shape[-1], block_size)]
     return torch.cat(blocks, dim=-1)

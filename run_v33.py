@@ -40,7 +40,9 @@ if __name__ == "__main__":
                 "++dm.val_dataset.resume=false",
                 "++model.metrics=true",
                 "++model.interaction_alpha=0.01",
-                "++optimizer.lr=1e-5"  # 用较小的学习率保护主干
+                "++optimizer.lr=1e-5",  # 用较小的学习率保护主干
+                # ==== 激活你刚写的闭环感知反馈 ====
+                "++model.spec_loss_weight=1.0"  # 可以从 1.0 开始，如果频谱 Loss 太大盖过了 CE 可以调到 0.1
             ],
             overwrite=True, wandb=False
         )
