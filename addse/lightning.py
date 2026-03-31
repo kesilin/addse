@@ -584,8 +584,24 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         log_cfg = kwargs.get("log_cfg")
         self.log_cfg = LogConfig() if log_cfg is None else log_cfg
         self.debug_sample = kwargs.get("debug_sample")
+
         self.register_buffer("running_sdr", torch.tensor(1.0))
         self.sdr_ema_alpha, self.sdr_threshold = 0.95, -4.0
+
+        # ================= 新增：强行注入 1.7 分老权重 =================
+        # 直接使用你截图里的 addse-s 模型的权重
+        pretrained_ckpt = "logs/addse-edbase-quick/checkpoints/addse-s.ckpt"
+        import os
+        if os.path.exists(pretrained_ckpt):
+            print(f"--- 正在加载 1.7 分主干权重: {pretrained_ckpt} ---")
+            ckpt_data = torch.load(pretrained_ckpt, map_location="cpu")
+            # 提取 state_dict，兼容 Lightning 保存格式
+            state_dict = ckpt_data.get("state_dict", ckpt_data)
+            # strict=False 极其关键！它会让老网络原有的参数被加载，而你新加的 Parallel 支路保持随机初始化
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            print(f"--- 权重加载完毕！新增参数数: {len(missing)} ---")
+        else:
+            print(f"⚠️ 未找到预训练权重 {pretrained_ckpt}，模型将从零开始盲猜！")
 
     @override
     def step(self, batch, stage, batch_idx, metrics=None):
@@ -631,17 +647,49 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
     @torch.no_grad()
     def solve(self, x_tok, x_q, num_steps, x_cont=None):
+        B, K, L = x_tok.shape
         y_tok = torch.full_like(x_tok, self.mask_token)
         for i in range(num_steps):
             mask = y_tok == self.mask_token
+            # 如果所有的 token 都已经被成功预测，直接提前结束
+            if not mask.any():
+                break
+            # 解码当前包含 mask 的 token 到连续空间
             y_q = self.nac.quantizer.decode(
                 y_tok.masked_fill(mask, 0),
                 output_no_sum=True,
                 domain="code"
             ).masked_fill(mask[:, None], 0)
-            # 推理时也传递 x_cont
+            # 模型预测 (传入了你的连续细粮特征 x_cont)
             log_p = self.log_score(y_q, x_q, x_cont=x_cont)
-            y_tok[mask] = torch.multinomial(log_p[mask].exp(), 1).squeeze(-1)
+            probs = log_p.exp()
+            # 采样当前处于 mask 状态的 token
+            sampled_tokens = torch.multinomial(probs[mask], 1).squeeze(-1)
+            # 建立一个完整的候选 y_tok
+            y_tok_new = y_tok.clone()
+            y_tok_new[mask] = sampled_tokens
+            # 如果是最后一步，全盘接收，直接退出
+            if i == num_steps - 1:
+                y_tok = y_tok_new
+                break
+            # ========= 核心修复：MaskGIT 置信度重掩码 =========
+            # 1. 获取刚刚采样的这批 token 的置信度
+            confidence = probs[mask].gather(-1, sampled_tokens.unsqueeze(-1)).squeeze(-1)
+            # 2. 构建一个全局置信度矩阵 (老 token 的置信度设为无穷大，保证它们不再被 mask)
+            conf_full = torch.full_like(y_tok, 1e9, dtype=torch.float32)
+            conf_full[mask] = confidence
+            # 3. 余弦退火调度：计算下一步还需要保留多少个 mask 
+            ratio = math.cos(math.pi / 2 * (i + 1) / num_steps)
+            num_mask = int(ratio * K * L)
+            if num_mask > 0:
+                # 找到当前置信度最低的 num_mask 个位置
+                conf_flat = conf_full.view(B, -1)
+                cutoff_vals, _ = torch.topk(conf_flat, num_mask, dim=-1, largest=False)
+                cutoff = cutoff_vals[:, -1:]
+                # 将低于阈值（不自信）的位置重新设为 mask_token，留给下一轮去猜
+                new_mask = (conf_flat <= cutoff).view(B, K, L)
+                y_tok_new[new_mask] = self.mask_token
+            y_tok = y_tok_new
         return y_tok
 
     def forward(self, x: torch.Tensor, return_nfe: bool = False, **kwargs):

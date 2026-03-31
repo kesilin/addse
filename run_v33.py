@@ -31,16 +31,16 @@ if __name__ == "__main__":
         train_func(
             config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
             overrides=[
-                "++trainer.max_epochs=20",
+                # "++trainer.max_epochs=20",  # 恢复默认 epoch
                 "++dm.train_dataloader.batch_size=8",
-                "++trainer.limit_train_batches=6", 
-                "++dm.train_dataloader.num_workers=0",
+                # "++trainer.limit_train_batches=6",  # 🚨 必须删掉！全量数据
+                # "++dm.train_dataloader.num_workers=0", # 如无 dataloader 报错可删掉
                 "++trainer.check_val_every_n_epoch=1",
-                # 解决小数据集 Epoch 报错
                 "++dm.train_dataset.resume=false",
                 "++dm.val_dataset.resume=false",
                 "++model.metrics=true",
-                "++model.interaction_alpha=0.01" # 初始轻微介入，保护 1.7 分主干
+                "++model.interaction_alpha=0.01",
+                "++optimizer.lr=1e-5"  # 用较小的学习率保护主干
             ],
             overwrite=True, wandb=False
         )
