@@ -5,19 +5,19 @@ from torch import Tensor
 from addse.layers import Snake1d
 
 def get_rot_emb(dim: int, max_seq_len: int) -> tuple[Tensor, Tensor]:
-    """Compute rotary embeddings."""
+    """计算旋转位置编码，放在文件顶部确保所有类可见。"""
     assert dim % 2 == 0
     pos = torch.arange(max_seq_len)
     omega = 1 / 10000 ** (torch.arange(0, dim, 2) / dim)
     angles = pos[:, None] * omega[None, :]
-    cos = angles.cos().repeat_interleave(2, dim=-1)
-    sin = angles.sin().repeat_interleave(2, dim=-1)
-    return cos, sin
+    return angles.cos().repeat_interleave(2, dim=-1), angles.sin().repeat_interleave(2, dim=-1)
 
 class ADDSERQDiT(nn.Module):
-    """Backbone RQDiT."""
+    """Backbone RQDiT: 保住 1.7 分基础语义的核心。"""
     def __init__(self, input_channels, output_channels, num_codebooks, hidden_dim, num_layers, num_heads, max_seq_len, conditional, time_independent):
         super().__init__()
+        self.input_channels = input_channels
+        self.output_channels = output_channels # 关键：显式保存
         elementwise_affine = not conditional and time_independent
         self.input_proj_x = nn.Linear(input_channels, hidden_dim)
         self.input_proj_c = nn.Linear(input_channels, hidden_dim) if conditional else None
@@ -34,32 +34,49 @@ class ADDSERQDiT(nn.Module):
             x, c = x[:, :, None, :], (None if c is None else c[:, :, None, :])
         B, _, K, L = x.shape
         if t is not None: t = self.t_emb(t)
-        if c is None:
-            c_time, c_dep = None, None
-        else:
+        if c is not None:
             c_p = self.input_proj_c(c.moveaxis(1, -1))
             c_time, c_dep = c_p.sum(dim=1) * self.dep_scale, c_p.transpose(1, 2).reshape(B * L, K, -1)
             t_dep = None if t is None else t.expand(B, -1).repeat_interleave(L, dim=0)
+        else: c_time = c_dep = t_dep = None
+        
         x_p = self.input_proj_x(x.moveaxis(1, -1))
         h = self.time_dit(x_p.sum(dim=1) * self.dep_scale, c_time, t)
         if self.dep_dit is not None:
             x_p = (x_p + h[:, None]) * self.skip_scale
-            x_p = self.dep_dit(x_p.transpose(1, 2).reshape(B * L, K, -1), c_dep, t_dep if t is not None else None).reshape(B, L, K, -1).transpose(1, 2)
+            x_p = self.dep_dit(x_p.transpose(1, 2).reshape(B * L, K, -1), c_dep, t_dep).reshape(B, L, K, -1).transpose(1, 2)
         else: x_p = h[:, None]
-        c_f = c if t is None else (t[:, None, None] if c is None else (c + t[:, None, None]) * self.skip_scale)
-        shift, scale = self.output_adaln(self.input_proj_c(c_f.moveaxis(1,-1)) if self.input_proj_c and c_f is not None else c_f).chunk(2, dim=-1) if self.output_adaln and c_f is not None else (0, 0)
-        x_p = (self.output_norm(x_p) * (1 + scale) + shift) * self.skip_scale
+        
+        # 处理 AdaLN 调节
+        cond = c if t is None else (t[:, None, None] if c is None else (c + t[:, None, None]) * self.skip_scale)
+        if cond is not None and self.output_adaln:
+            # 确保 condition 映射到 hidden_dim
+            cond_p = self.input_proj_c(cond.moveaxis(1, -1)) if self.input_proj_c else cond
+            shift, scale = self.output_adaln(cond_p).chunk(2, dim=-1)
+            x_p = (self.output_norm(x_p) * (1 + scale) + shift) * self.skip_scale
+        else:
+            x_p = self.output_norm(x_p) * self.skip_scale
+            
         x_out = self.output_proj(x_p).moveaxis(-1, 1)
         return x_out.squeeze(2) if squeeze_output else x_out
 
 class ADDSERQDiTParallel(ADDSERQDiT):
-    """ADDSE V3.3 Evolved: 主干保护 + 连续特征直通架构。"""
+    """ADDSE V3.3 Evolved: 
+    输出端修正 + 特征双轨 (粗粮喂主干，细粮喂 Refiner)。
+    """
     def __init__(self, **kwargs) -> None:
-        self.input_channels, self.adapter_hidden = kwargs.get("input_channels"), kwargs.get("adapter_hidden", 256)
+        # 第一时间保存并传递 output_channels
+        self.output_channels = kwargs.get("output_channels")
+        self.adapter_hidden = kwargs.get("adapter_hidden", 256)
         self.alpha_max, self.interaction_alpha = kwargs.get("alpha_max", 0.08), kwargs.get("interaction_alpha", 0.1)
         self.dynamic_alpha = kwargs.get("dynamic_alpha", False)
-        f_kwargs = {k: v for k, v in kwargs.items() if k in ["input_channels", "output_channels", "num_codebooks", "hidden_dim", "num_layers", "num_heads", "max_seq_len", "conditional", "time_independent"]}
+        
+        # 严格对齐父类初始化
+        p_keys = ["input_channels", "output_channels", "num_codebooks", "hidden_dim", "num_layers", "num_heads", "max_seq_len", "conditional", "time_independent"]
+        f_kwargs = {k: v for k, v in kwargs.items() if k in p_keys}
         super().__init__(**f_kwargs)
+
+        # Refiner 保持不变
         self.refiner = nn.Sequential(
             nn.Conv2d(self.input_channels, self.adapter_hidden, kernel_size=(3, 1), padding=(1, 0), dilation=1),
             Snake1d(self.adapter_hidden), 
@@ -81,9 +98,10 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             nn.init.constant_(self.gate_proj.bias, -4.0)
 
     def forward(self, x, c, t, c_cont=None):
-        # 【核心修正】复活主干：传入真实的离散特征 c，保住 1.7 分底分
+        # 【复活主干】传入真实的离散条件 c，重回 1.7 分高水准
         z_base = super().forward(x, c, t) 
-        # 支路直通：Refiner 优先吃高精度的 c_cont
+        
+        # 【细粮直通】Refiner 支路使用 Pre-VQ 连续特征 c_cont
         c_ref = c_cont if c_cont is not None else c
         if c_ref is not None:
             c_4d = c_ref[:, :, None, :] if c_ref.ndim == 3 else c_ref
@@ -95,7 +113,7 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             return z_base + alpha_total * (torch.tanh(gamma) * z_base + beta)
         return z_base
 
-# --- 保留 ADDSEDiT, ADDSESelfAttentionBlock 等原始主干辅助类 ---
+# 后续辅助类 ADDSEDiT, ADDSESelfAttentionBlock 等保持 Git 源码完整...
 class ADDSEDiT(nn.Module):
     def __init__(self, dim, num_layers, num_heads, max_seq_len, elementwise_affine):
         super().__init__()
@@ -131,7 +149,8 @@ class ADDSESelfAttentionBlock(nn.Module):
         q, k, v = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q_rot, k_rot = torch.stack([-q[..., 1::2], q[..., ::2]], dim=-1).reshape(q.shape), torch.stack([-k[..., 1::2], k[..., ::2]], dim=-1).reshape(k.shape)
         q, k = q * cos[None, None, :L] + q_rot * sin[None, None, :L], k * cos[None, None, :L] + k_rot * sin[None, None, :L]
-        return self.proj(((self.scale * q @ k.transpose(-2, -1)).softmax(dim=-1) @ v).transpose(1, 2).reshape(B, L, C))
+        attn = (self.scale * q @ k.transpose(-2, -1)).softmax(dim=-1)
+        return self.proj((attn @ v).transpose(1, 2).reshape(B, L, C))
 
 class ADDSEEmbeddingBlock(nn.Module):
     def __init__(self, dim, emb_dim=256):
