@@ -83,7 +83,7 @@ class ConfigureOptimizersMixin(L.LightningModule):
         return output
 
 # ======================================================================
-# ADDSELightningModule (100% 稳定纯净版 - 专注 Stage 1 训练)
+# ADDSELightningModule (STE + Latent Feature Matching 顶会架构版)
 # ======================================================================
 class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     def __init__(self, nac_cfg: str, nac_ckpt: str, model: ADDSERQDiT, num_steps: int, block_size: int, **kwargs) -> None:
@@ -104,7 +104,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.sdr_ema_alpha, self.sdr_threshold = 0.95, -4.0
 
         # 加载 1.7 分主干权重
-        pretrained_ckpt = "logs/addse-s/checkpoints/last.ckpt" 
+        pretrained_ckpt = "logs/addse-edbase-quick/checkpoints/addse-s.ckpt" # 确保这个路径是你 1.7分的权重
         import os
         if os.path.exists(pretrained_ckpt):
             print(f"--- 正在加载 1.7 分主干权重: {pretrained_ckpt} ---")
@@ -120,7 +120,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         lambd = torch.rand(B, device=y_tok.device)
         mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]
         y_lambda_q = y_q.clone()
-        y_lambda_q.masked_fill_(mask[:, None], 0)
+        y_lambda_q.masked_fill_(mask.unsqueeze(1), 0)
         
         log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
         V = log_score.shape[-1]
@@ -135,6 +135,34 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         score = process_in_blocks((y_q, x_q, x_c_in), self.block_size, model_wrapper)
         return score.moveaxis(1, -1).log_softmax(dim=-1)
 
+    # ======================================================================
+    # 【核心升级 1】：使用直通估计器 (STE) 代替单纯的 Soft Quantization
+    # 直接查码本矩阵，100% 避开 decode 黑盒的维度错乱
+    # ======================================================================
+    def ste_quantize(self, log_score: torch.Tensor):
+        probs = torch.softmax(log_score, dim=-1) # (B, K, L, V)
+        hard_tokens = log_score.argmax(dim=-1)   # 取硬特征: (B, K, L)
+        B, K, L, V = probs.shape
+        
+        soft_q_list, hard_q_list = [], []
+        
+        for k in range(K):
+            weight = self.nac.quantizer.codebooks[k].codebook.weight # (V, C)
+            
+            # 软路径 (用于反向传播传导梯度): 概率 @ 权重
+            soft_q_k = torch.matmul(probs[:, k, :, :], weight).transpose(1, 2) # -> (B, C, L)
+            soft_q_list.append(soft_q_k)
+            
+            # 硬路径 (用于前向传播贴近真实分布): 直接 Embedding 查表，绝对安全
+            hard_q_k = F.embedding(hard_tokens[:, k, :], weight).transpose(1, 2) # -> (B, C, L)
+            hard_q_list.append(hard_q_k)
+            
+        soft_q = torch.stack(soft_q_list, dim=2) # (B, C, K, L)
+        hard_q = torch.stack(hard_q_list, dim=2) # (B, C, K, L)
+        
+        # STE 魔法：前向走 hard_q，反向走 soft_q
+        return hard_q.detach() + soft_q - soft_q.detach()
+
     @override
     def step(self, batch, stage, batch_idx, metrics=None):
         x, y, _ = batch
@@ -142,17 +170,47 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         xy_tok, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=True, domain="q")
         x_tok, y_tok = xy_tok.chunk(2); x_q, y_q = xy_q.chunk(2)
 
-        # 仅计算稳定的分类重构损失 (CE Loss)，并联支路会通过它学习提取高频特征
+        # 1. 语义离散交叉熵 (CE Loss)
         ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat)
+        mask_expanded = mask.unsqueeze(1) # (B, 1, K, L)
         
-        self.log(f"{stage}/loss", ce_loss, prog_bar=True, sync_dist=True)
+        # 2. 预测的量化特征 (采用 STE, 消除域鸿沟)
+        y_pred_q = self.ste_quantize(log_score) # 绝对安全的 (B, C, K, L)
+        
+        # 将已知(未遮蔽)的 Token 替换回 Ground Truth
+        y_mixed_q = torch.where(mask_expanded, y_pred_q, y_q)
+        
+        # ======================================================================
+        # 【核心升级 2】：隐空间特征匹配损失 (Latent Feature Matching)
+        # 直接强迫预测的特征在隐空间贴近干净语音的连续特征，解决高频相位丢失问题
+        # ======================================================================
+        latent_loss = F.l1_loss(y_mixed_q, y_q)
+        
+        total_loss = ce_loss + 10.0 * latent_loss # 隐空间特征匹配权重一般设为 10.0
+        
+        self.log(f"{stage}/ce_loss", ce_loss, prog_bar=True, sync_dist=True)
+        self.log(f"{stage}/latent_loss", latent_loss, prog_bar=True, sync_dist=True)
+
+        # 3. 波形频谱监督 (可选，如果在 config 里配置了)
+        if stage == "train" and self.spec_loss is not None and self.spec_loss_weight > 0:
+            y_mixed_q_sum = y_mixed_q.sum(dim=2) # (B, C, L)
+            if hasattr(self.nac, "generator"):
+                y_hat_soft = self.nac.generator(y_mixed_q_sum)
+            else:
+                y_hat_soft = self.nac.decode(y_mixed_q_sum, domain="q")
+            y_hat_soft = y_hat_soft[..., :y.shape[-1]]
+            spec_loss_val = self.spec_loss(y_hat_soft, y)
+            total_loss += self.spec_loss_weight * spec_loss_val
+            self.log(f"{stage}/spec_loss", spec_loss_val, prog_bar=True, sync_dist=True)
+
+        self.log(f"{stage}/loss", total_loss, prog_bar=False, sync_dist=True)
 
         if metrics or (stage == "val" and batch_idx == 0):
             y_hat_tok = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
             y_hat = self.nac.decode(y_hat_tok, domain="code")
-            return {"loss": ce_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
+            return {"loss": total_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
             
-        return {"loss": ce_loss}, {}, {}
+        return {"loss": total_loss}, {}, {}
 
     @torch.no_grad()
     def solve(self, x_tok, x_q, num_steps, x_cont=None):
@@ -163,12 +221,20 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             mask = y_tok == self.mask_token
             if not mask.any(): break
             
-            # 使用 NAC 自带的最稳定的 decode 方法获取连续特征
-            y_q = self.nac.quantizer.decode(
+            y_q_step = self.nac.quantizer.decode(
                 y_tok.masked_fill(mask, 0), output_no_sum=True, domain="code"
-            ).masked_fill(mask[:, None], 0)
+            )
+            # 物理级防御：修正解码器可能返回的诡异维度
+            if y_q_step.shape != x_q.shape:
+                if y_q_step.ndim == 4:
+                    if y_q_step.shape[2] == x_q.shape[1]:
+                        y_q_step = y_q_step.transpose(1, 2)
+                    elif y_q_step.shape[1] != x_q.shape[1]:
+                        y_q_step = y_q_step.reshape(x_q.shape)
+                        
+            y_q_step = y_q_step.masked_fill(mask.unsqueeze(1), 0)
             
-            log_p = self.log_score(y_q, x_q, x_cont=x_cont)
+            log_p = self.log_score(y_q_step, x_q, x_cont=x_cont)
             probs = log_p.exp()
             sampled_tokens = torch.multinomial(probs[mask], 1).squeeze(-1)
             y_tok_new = y_tok.clone()
