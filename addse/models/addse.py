@@ -40,34 +40,26 @@ class ADDSERQDiT(nn.Module):
             c_p = self.input_proj_c(c.moveaxis(1, -1))
             c_time, c_dep = c_p.sum(dim=1) * self.dep_scale, c_p.transpose(1, 2).reshape(B * L, K, -1)
             t_dep = None if t is None else t.expand(B, -1).repeat_interleave(L, dim=0)
-
         x_p = self.input_proj_x(x.moveaxis(1, -1))
         h = self.time_dit(x_p.sum(dim=1) * self.dep_scale, c_time, t)
         if self.dep_dit is not None:
             x_p = (x_p + h[:, None]) * self.skip_scale
             x_p = self.dep_dit(x_p.transpose(1, 2).reshape(B * L, K, -1), c_dep, t_dep if t is not None else None).reshape(B, L, K, -1).transpose(1, 2)
         else: x_p = h[:, None]
-        
         c_f = c if t is None else (t[:, None, None] if c is None else (c + t[:, None, None]) * self.skip_scale)
-        if c_f is None:
-            shift, scale = 0, 0
-        else:
-            c_f_p = self.input_proj_c(c_f.moveaxis(1, -1)) if self.input_proj_c else c_f
-            shift, scale = self.output_adaln(c_f_p).chunk(2, dim=-1)
-            
+        shift, scale = self.output_adaln(self.input_proj_c(c_f.moveaxis(1,-1)) if self.input_proj_c and c_f is not None else c_f).chunk(2, dim=-1) if self.output_adaln and c_f is not None else (0, 0)
         x_p = (self.output_norm(x_p) * (1 + scale) + shift) * self.skip_scale
         x_out = self.output_proj(x_p).moveaxis(-1, 1)
         return x_out.squeeze(2) if squeeze_output else x_out
 
 class ADDSERQDiTParallel(ADDSERQDiT):
-    """V3.3 Evolved: 主干保护 + 连续特征直通。"""
+    """ADDSE V3.3 Evolved: 主干保护 + 连续特征直通架构。"""
     def __init__(self, **kwargs) -> None:
         self.input_channels, self.adapter_hidden = kwargs.get("input_channels"), kwargs.get("adapter_hidden", 256)
         self.alpha_max, self.interaction_alpha = kwargs.get("alpha_max", 0.08), kwargs.get("interaction_alpha", 0.1)
         self.dynamic_alpha = kwargs.get("dynamic_alpha", False)
         f_kwargs = {k: v for k, v in kwargs.items() if k in ["input_channels", "output_channels", "num_codebooks", "hidden_dim", "num_layers", "num_heads", "max_seq_len", "conditional", "time_independent"]}
         super().__init__(**f_kwargs)
-
         self.refiner = nn.Sequential(
             nn.Conv2d(self.input_channels, self.adapter_hidden, kernel_size=(3, 1), padding=(1, 0), dilation=1),
             Snake1d(self.adapter_hidden), 
@@ -89,22 +81,21 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             nn.init.constant_(self.gate_proj.bias, -4.0)
 
     def forward(self, x, c, t, c_cont=None):
-        # 【复活主干】必须传入真实的离散条件 c，重回 1.7 分基准
+        # 【核心修正】复活主干：传入真实的离散特征 c，保住 1.7 分底分
         z_base = super().forward(x, c, t) 
-        
-        # 【连续直通】Refiner 优先使用 Pre-VQ 特征 c_cont
+        # 支路直通：Refiner 优先吃高精度的 c_cont
         c_ref = c_cont if c_cont is not None else c
         if c_ref is not None:
             c_4d = c_ref[:, :, None, :] if c_ref.ndim == 3 else c_ref
             gamma, beta = self.refiner(c_4d).chunk(2, dim=1)
             gate = torch.sigmoid(self.gate_proj(c_4d))
-            alpha = (self.alpha_max * torch.sigmoid(self.alpha_proj(c_4d))) if self.alpha_proj else self.interaction_alpha
+            alpha = self.alpha_max * torch.sigmoid(self.alpha_proj(c_4d)) if self.alpha_proj else self.interaction_alpha
             alpha_total = alpha * gate
-            if z_base.ndim == 3:
-                alpha_total, gamma, beta = alpha_total.squeeze(2), gamma.squeeze(2), beta.squeeze(2)
+            if z_base.ndim == 3: alpha_total, gamma, beta = alpha_total.squeeze(2), gamma.squeeze(2), beta.squeeze(2)
             return z_base + alpha_total * (torch.tanh(gamma) * z_base + beta)
         return z_base
 
+# --- 保留 ADDSEDiT, ADDSESelfAttentionBlock 等原始主干辅助类 ---
 class ADDSEDiT(nn.Module):
     def __init__(self, dim, num_layers, num_heads, max_seq_len, elementwise_affine):
         super().__init__()
@@ -125,11 +116,9 @@ class ADDSEDiTBlock(nn.Module):
         self.adaln = None if elementwise_affine else nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
         self.skip_scale = 2**-0.5
     def forward(self, x, c, cos, sin):
-        if self.adaln is not None and c is not None:
-            sh1, sc1, g1, sh2, sc2, g2 = self.adaln(c).chunk(6, dim=-1)
-            x = (x + g1 * self.msa((self.norm_1(x) * (1 + sc1) + sh1) * self.skip_scale, cos, sin)) * self.skip_scale
-            return (x + g2 * self.mlp((self.norm_2(x) * (1 + sc2) + sh2) * self.skip_scale)) * self.skip_scale
-        return (x + self.msa(self.norm_1(x), cos, sin)) * self.skip_scale
+        sh1, sc1, g1, sh2, sc2, g2 = self.adaln(c).chunk(6, dim=-1) if (self.adaln and c is not None) else (0, 0, 1, 0, 0, 1)
+        x = (x + g1 * self.msa((self.norm_1(x) * (1 + sc1) + sh1) * self.skip_scale, cos, sin)) * self.skip_scale
+        return (x + g2 * self.mlp((self.norm_2(x) * (1 + sc2) + sh2) * self.skip_scale)) * self.skip_scale
 
 class ADDSESelfAttentionBlock(nn.Module):
     def __init__(self, dim, num_heads):
@@ -140,17 +129,14 @@ class ADDSESelfAttentionBlock(nn.Module):
     def forward(self, x, cos, sin):
         B, L, C = x.shape
         q, k, v = self.qkv(x).reshape(B, L, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q_rot = torch.stack([-q[..., 1::2], q[..., ::2]], dim=-1).reshape(q.shape)
-        k_rot = torch.stack([-k[..., 1::2], k[..., ::2]], dim=-1).reshape(k.shape)
+        q_rot, k_rot = torch.stack([-q[..., 1::2], q[..., ::2]], dim=-1).reshape(q.shape), torch.stack([-k[..., 1::2], k[..., ::2]], dim=-1).reshape(k.shape)
         q, k = q * cos[None, None, :L] + q_rot * sin[None, None, :L], k * cos[None, None, :L] + k_rot * sin[None, None, :L]
-        attn = (self.scale * q @ k.transpose(-2, -1)).softmax(dim=-1)
-        return self.proj((attn @ v).transpose(1, 2).reshape(B, L, C))
+        return self.proj(((self.scale * q @ k.transpose(-2, -1)).softmax(dim=-1) @ v).transpose(1, 2).reshape(B, L, C))
 
 class ADDSEEmbeddingBlock(nn.Module):
     def __init__(self, dim, emb_dim=256):
         super().__init__()
         self.mlp = nn.Sequential(nn.Linear(emb_dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-        self.register_buffer("freqs", 2 * torch.pi * torch.randn(emb_dim))
-        self.register_buffer("phases", 2 * torch.pi * torch.rand(emb_dim))
+        self.register_buffer("freqs", 2 * torch.pi * torch.randn(emb_dim)); self.register_buffer("phases", 2 * torch.pi * torch.rand(emb_dim))
     def forward(self, x):
         return self.mlp(2.0**0.5 * torch.cos(x[:, None] * self.freqs[None, :] + self.phases[None, :]))

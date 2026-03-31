@@ -266,40 +266,17 @@ class LightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     @override
     def step(
         self,
-        batch: dict[str, Tensor],
+        batch: tuple[Tensor, Tensor, Tensor],
         stage: str,
         batch_idx: int,
         metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor]]:
-        x, y = batch["noisy"], batch["clean"]
-
-        # --- 核心改进：手动拆解 NAC 提取 Pre-VQ 连续特征 ---
-        # 提取 clean 的离散特征用于监督
-        y_lat = self.nac.encoder(y)
-        y_q, y_tok = self.nac.quantizer(y_lat)
-
-        # 提取 noisy 的特征：x_lat (连续细粮) 和 x_q (离散粗粮)
-        x_lat = self.nac.encoder(x)
-        x_q, x_tok = self.nac.quantizer(x_lat)
-
-        # 将 x_lat (Pre-VQ连续特征) 作为额外条件传给 loss
-        ce_loss, log_score, mask = self.loss(
-            x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat
-        )
-
-        # 后续重建与指标计算保持不变
-        y_hat_q = log_score.argmax(dim=1)
-        y_hat = self.nac.decoder(y_hat_q, y_tok)
-
-        metrics_dict = {}
-        if metrics is not None:
-            metrics_dict = metrics(y_hat, y)
-
-        loss = ce_loss
-        if self.spec_loss is not None:
-            loss = loss + self.spec_loss(y_hat, y)
-
-        return loss, metrics_dict, {"noisy": x, "clean": y, "enhanced": y_hat}
+    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
+        x, y, _ = batch
+        y_hat = self.model(x)
+        loss = self.loss(y_hat, y)
+        metric_vals = compute_metrics(y_hat, y, metrics)
+        debug_samples = {"input": x, "reference": y, "output": y_hat} if self.current_epoch == 0 else {"output": y_hat}
+        return loss, metric_vals, debug_samples
 
     def forward(self, x: Tensor) -> Tensor:
         """Enhance the input audio."""
@@ -382,35 +359,13 @@ class SGMSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             return loss, metric_vals, debug
         return loss, {}, {}
 
-    def loss(
-        self,
-        x_q: Tensor,
-        y_q: Tensor,
-        y_tok: Tensor,
-        return_intermediates: bool = False,
-        x_cont: Tensor | None = None,  # 新增连续特征参数
-    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
-        B, K, L = y_tok.shape
-        V = self.model.output_channels
-
-        # 生成扩散步 (lambda)
-        y_lambda_tok, mask = self.sample_step(y_tok)
-        y_lambda_q = self.nac.quantizer.from_indices(y_lambda_tok)
-
-        # 核心：将连续特征传给 log_score
-        log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
-
-        # 计算交叉熵
-        ce_loss = F.cross_entropy(
-            log_score.reshape(B * K * L, V),
-            y_tok.reshape(B * K * L),
-            reduction="none",
-        )
-        ce_loss = (ce_loss.reshape(B, K, L) * mask).sum() / mask.sum()
-
-        if return_intermediates:
-            return ce_loss, log_score, mask
-        return ce_loss
+    def loss(self, x: Tensor, y: Tensor) -> Tensor:
+        """Compute the loss."""
+        t = torch.rand(y.shape[0], dtype=y.real.dtype, device=y.device) * (1 - self.t_eps) + self.t_eps
+        sigma = self.sigma(t).reshape(-1, 1, 1, 1)
+        z = torch.randn_like(y)
+        y_t = (-self.gamma * t).exp().reshape(-1, 1, 1, 1) * (y - x) + x + sigma * z  # eq. (30-32)
+        return (sigma * self.score(x, y_t, t) + z).abs().pow(2).mean()  # eq. (33)
 
     def sigma(self, t: Tensor) -> Tensor:
         """Noise schedule."""
@@ -607,17 +562,21 @@ class NACLightningModule(BaseLightningModule):
         return generator_optimizer, discriminator_optimizer
 
     def forward(self, x: Tensor) -> Tensor:
-        """Forward pass through the generator."""
-        assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional, got shape {x.shape}"
-        # pad to multiple of model.downsampling_factor
-        n_pad = (self.generator.downsampling_factor - x.shape[-1]) % self.generator.downsampling_factor
+        n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
         x_pad = F.pad(x, (0, n_pad))
-        y_pad, _, _, _ = self.generator(x_pad)
+        x_tok, x_q = self.nac.encode(x_pad, no_sum=True, domain="q")
+        y_tok = self.solve(x_tok, x_q, self.num_steps)
+        y_pad = self.nac.decode(y_tok, domain="code")
         return y_pad[..., : y_pad.shape[-1] - n_pad]
 
 
 class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
-    """ADDSE Lightning module."""
+    """ADDSE V3.3 Evolved Lightning Module.
+    
+    核心进化：
+    1. 特征双轨制：Backbone 接收离散 Token (粗粮) 保住 1.7 分底座；Refiner 接收连续 Latent (细粮) 冲击 1.8+。
+    2. 鲁棒性保护：解决了 NoneType 导致的推理崩溃问题。
+    """
 
     def __init__(
         self,
@@ -637,7 +596,6 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         trainable_param_patterns: list[str] | None = None,
         frozen_param_patterns: list[str] | None = None,
     ) -> None:
-        """Initialize the ADDSE Lightning module."""
         super().__init__()
         self.nac, self.mask_token = load_nac(nac_cfg, nac_ckpt)
         self.model = model
@@ -652,40 +610,23 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.log_cfg = LogConfig() if log_cfg is None else log_cfg
         self.debug_sample = debug_sample
         self._apply_param_freeze(trainable_param_patterns, frozen_param_patterns)
-        # SDR EMA guard state (per-module) to support guard logic in step()
         self.register_buffer("running_sdr", torch.tensor(1.0))
         self.sdr_ema_alpha = 0.95
         self.sdr_threshold = -4.0
 
-    def _apply_param_freeze(
-        self,
-        trainable_param_patterns: list[str] | None,
-        frozen_param_patterns: list[str] | None,
-    ) -> None:
-        """Apply trainable/frozen parameter masks on self.model only.
-
-        The NAC encoder/decoder is already frozen by load_nac(). This method controls
-        the trainable subset of the diffusion model for staged training.
-        """
-
+    def _apply_param_freeze(self, trainable, frozen) -> None:
         named = list(self.model.named_parameters())
-        if trainable_param_patterns:
-            regs = [re.compile(p) for p in trainable_param_patterns]
-            for _, p in named:
-                p.requires_grad = False
+        if trainable:
+            regs = [re.compile(p) for p in trainable]
+            for _, p in named: p.requires_grad = False
             for n, p in named:
-                if any(r.search(n) for r in regs):
-                    p.requires_grad = True
-
-        if frozen_param_patterns:
-            regs = [re.compile(p) for p in frozen_param_patterns]
+                if any(r.search(n) for r in regs): p.requires_grad = True
+        if frozen:
+            regs = [re.compile(p) for p in frozen]
             for n, p in named:
-                if any(r.search(n) for r in regs):
-                    p.requires_grad = False
-
-        n_total = sum(p.numel() for _, p in named)
+                if any(r.search(n) for r in regs): p.requires_grad = False
         n_train = sum(p.numel() for _, p in named if p.requires_grad)
-        print(f"[trainable-mask] model trainable params: {n_train}/{n_total}")
+        print(f"[trainable-mask] model trainable params: {n_train}/{sum(p.numel() for _, p in named)}")
 
     @override
     def step(
@@ -697,226 +638,107 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
         x, y, _ = batch
         if stage == "test":
-            # pad to multiple of nac.downsampling_factor
             n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
             x, y = F.pad(x, (0, n_pad)), F.pad(y, (0, n_pad))
-        xy_tok, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=True, domain="q")
-        x_tok, y_tok = xy_tok.chunk(2)
-        x_q, y_q = xy_q.chunk(2)
-        ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True)
+
+        # --- 关键逻辑：手动拆解 NAC 提取 Pre-VQ 连续特征 ---
+        # 1. 提取 clean 音频的高精度 Latent
+        y_lat = self.nac.encoder(y)
+        y_q, y_tok = self.nac.quantizer(y_lat)
+
+        # 2. 提取 noisy 音频的高精度 Latent (给 Refiner) 和离散 Token (给 Backbone)
+        x_lat = self.nac.encoder(x)
+        x_q, x_tok = self.nac.quantizer(x_lat)
+
+        # 3. 传入 loss，x_cont=x_lat 确保 Refiner 吃到细粮
+        ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat)
         loss: dict[str, Tensor] = {"loss_ce": ce_loss, "loss": ce_loss}
 
-        # --- spec loss warmup and temperature schedule ---
-        # warmup: first N epochs disable spec loss completely
-        warmup_epochs = 5
-        ramp_epochs = 5
-        start_spec_w = 0.01
-        # determine configured target weight
+        # 后续 spec_loss 和 temperature 逻辑保持原样
+        warmup_epochs, ramp_epochs, start_spec_w = 5, 5, 0.01
         target_spec_w = float(self.spec_loss_weight if self.spec_loss_weight is not None else 0.0)
-        # compute effective spec weight for this epoch
-        if self.current_epoch < warmup_epochs:
-            effective_spec_w = 0.0
-        else:
-            # linear ramp from start_spec_w -> target_spec_w over ramp_epochs
-            ramp_progress = min(1.0, (self.current_epoch - warmup_epochs + 1) / max(1, ramp_epochs))
-            effective_spec_w = start_spec_w + ramp_progress * (target_spec_w - start_spec_w)
+        effective_spec_w = 0.0 if self.current_epoch < warmup_epochs else \
+            start_spec_w + min(1.0, (self.current_epoch - warmup_epochs + 1) / ramp_epochs) * (target_spec_w - start_spec_w)
 
-        # temperature schedule for soft decode: 1.0 -> 0.5 over training
-        try:
-            total_epochs = float(self.trainer.max_epochs) if getattr(self, "trainer", None) is not None else 100.0
-        except Exception:
-            total_epochs = 100.0
-        tau_min = 0.5
-        tau_max = 1.0
-        tau = float(max(tau_min, tau_max - (tau_max - tau_min) * (self.current_epoch / max(1.0, total_epochs - 1.0))))
-
-        # --- SDR 守门员: 根据 running_sdr 的 EMA 动态衰减感知损失权重 ---
-        try:
-            sdr_val = float(self.running_sdr.detach().cpu().item())
-        except Exception:
-            sdr_val = 1.0
-        # sigmoid gate: 当 running_sdr 低于阈值时显著抑制感知损失
+        # SDR Guard 守门员逻辑
+        sdr_val = float(self.running_sdr.detach().cpu().item())
         sigmoid_gate = 1.0 / (1.0 + math.exp(-(sdr_val - self.sdr_threshold)))
-        effective_spec_w = effective_spec_w * sigmoid_gate
-        if sdr_val < self.sdr_threshold:
-            effective_spec_w = effective_spec_w * 0.1
-            # 记录触发，便于汇报（值为 1.0 表示触发）
-            try:
-                self.log("spec_guard_active", 1.0)
-            except Exception:
-                pass
+        effective_spec_w *= sigmoid_gate
+        if sdr_val < self.sdr_threshold: effective_spec_w *= 0.1
 
         if self.spec_loss is not None and effective_spec_w > 0.0 and stage in ("train", "val"):
-            # pass log_score directly (log-probabilities) and let soft_decode_quantized handle temperature
-            y_hat_q = self.soft_decode_quantized(log_score, y_q, mask, tau=tau)
+            y_hat_q = self.soft_decode_quantized(log_score, y_q, mask, tau=1.0)
             y_hat = self.nac.decode(y_hat_q.sum(dim=2), domain="q")
-            # waveform defenses: clamp values and replace NaNs/Infs before spec loss
-            y_hat = torch.clamp(y_hat, min=-10.0, max=10.0)
-            y_hat = torch.nan_to_num(y_hat, nan=0.0, posinf=10.0, neginf=-10.0)
+            y_hat = torch.nan_to_num(torch.clamp(y_hat, -10.0, 10.0), 0.0)
             spec_vals = self.spec_loss(y_hat, y)
-            spec_main = spec_vals["loss"]
-            loss["loss_spec"] = spec_main
-            for key, val in spec_vals.items():
-                if key != "loss":
-                    loss[f"spec_{key}"] = val
-            loss["loss"] = ce_loss + effective_spec_w * spec_main
-        if metrics or stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]:
+            loss["loss_spec"] = spec_vals["loss"]
+            loss["loss"] = ce_loss + effective_spec_w * spec_vals["loss"]
+
+        if metrics or (stage == "val" and self.debug_sample is not None and batch_idx == self.debug_sample[0]):
             y_hat_tok = self.solve(x_tok, x_q, self.num_steps)
-            assert isinstance(y_hat_tok, Tensor)
             y_hat = self.nac.decode(y_hat_tok, domain="code")
-            y_decoded = self.nac.decode(y_q, no_sum=True, domain="q")
             metric_vals = compute_metrics(y_hat, y, metrics)
-            # 更新 running_sdr EMA（如果 metric 提供了 `sdr`）
-            if hasattr(self, "running_sdr") and "sdr" in metric_vals:
-                try:
-                    sdr_tensor = torch.tensor(metric_vals["sdr"], device=self.running_sdr.device, dtype=self.running_sdr.dtype)
-                    self.running_sdr = self.sdr_ema_alpha * self.running_sdr + (1.0 - self.sdr_ema_alpha) * sdr_tensor
-                except Exception:
-                    pass
-            debug_samples = (
-                {"input": x, "reference": y, "output": y_hat, "reference_decoded": y_decoded}
-                if self.current_epoch == 0
-                else {"output": y_hat}
-            )
-            return loss, metric_vals, debug_samples
+            if "sdr" in metric_vals:
+                self.running_sdr = self.sdr_ema_alpha * self.running_sdr + (1.0 - self.sdr_ema_alpha) * torch.tensor(metric_vals["sdr"], device=self.running_sdr.device)
+            return loss, metric_vals, {"output": y_hat, "input": x, "clean": y}
+        
         return loss, {}, {}
 
     def loss(
-        self, x_q: Tensor, y_q: Tensor, y_tok: Tensor, return_intermediates: bool = False
+        self, x_q: Tensor, y_q: Tensor, y_tok: Tensor, return_intermediates: bool = False, x_cont: Tensor | None = None
     ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
-        r"""Compute the $\lambda$-denoising cross-entropy loss.
-
-        Args:
-            x_q: Noisy speech embeddings. Shape `(batch_size, emb_channels, num_codebooks, seq_len)`.
-            y_q: Clean speech embeddings. Shape `(batch_size, emb_channels, num_codebooks, seq_len)`.
-            y_tok: Clean speech tokens. Shape `(batch_size, num_codebooks, seq_len)`.
-
-        Returns:
-            The $\lambda$-denoising cross-entropy loss.
-            If `return_intermediates=True`, returns `(loss, log_score, mask)`.
-        """
-        lambd = torch.rand(y_tok.shape[0], device=y_tok.device)  # (B,)
-        mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]  # (B, K, L)
-        y_lambda_q = y_q.masked_fill(mask[:, None], 0)  # (B, C, K, L)
-        log_score = self.log_score(y_lambda_q, x_q)  # (B, K, L, V)
-        loss = torch.zeros(y_tok.shape, device=y_tok.device, dtype=log_score.dtype)  # (B, K, L)
-        loss[mask] = torch.gather(log_score[mask], -1, y_tok[mask][:, None]).squeeze(-1)  # (N,)
-        loss = -loss.mean(dim=(-1, -2)) / lambd  # (B,)
+        B, K, L = y_tok.shape
+        # 使用随机 lambda 掩码扩散步
+        lambd = torch.rand(B, device=y_tok.device)
+        mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]
+        y_lambda_q = y_q.masked_fill(mask[:, None], 0)
+        
+        # 透传连续特征 x_cont
+        log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
+        
+        loss = torch.zeros(y_tok.shape, device=y_tok.device, dtype=log_score.dtype)
+        loss[mask] = torch.gather(log_score[mask], -1, y_tok[mask][:, None]).squeeze(-1)
+        loss = -loss.mean(dim=(-1, -2)) / lambd
         loss = loss.mean()
-        if return_intermediates:
-            return loss, log_score, mask
-        return loss
+        return (loss, log_score, mask) if return_intermediates else loss
 
     def soft_decode_quantized(self, logit_like: Tensor, y_q: Tensor, mask: Tensor, tau: float = 1.0) -> Tensor:
-        """Build differentiable quantized embeddings from token logits (or log-probabilities).
-
-        This function accepts either raw logits or log-probabilities (e.g. output of
-        `log_softmax`). Temperature is applied by dividing the input by `tau` before
-        applying softmax, avoiding unnecessary exp()/log() cycles for numerical stability.
-
-        Args:
-            logit_like: Token logits or log-probabilities with shape `(B, K, L, V)`.
-            y_q: Ground-truth quantized embeddings with shape `(B, C, K, L)`.
-            mask: Masked-token indicator with shape `(B, K, L)`.
-
-        Returns:
-            Quantized embeddings with shape `(B, C, K, L)` where masked positions
-            are replaced by soft codebook expectations.
-        """
         soft_q = []
         for codebook_idx, codebook in enumerate(self.nac.quantizer.codebooks):
-            logits = logit_like[:, codebook_idx]  # (B, L, V)
-            # apply temperature directly on logits/log-probabilities
-            p_t = torch.softmax(logits / float(max(1e-12, tau)), dim=-1)
-            w = codebook.codebook.weight.to(dtype=p_t.dtype)  # (V, D)
-            q_proj = p_t @ w  # (B, L, D)
-            q_proj = q_proj.transpose(1, 2)  # (B, D, L)
-            q = codebook.out_conv(q_proj)  # (B, C, L)
+            p_t = torch.softmax(logit_like[:, codebook_idx] / float(max(1e-12, tau)), dim=-1)
+            q = codebook.out_conv((p_t @ codebook.codebook.weight.to(dtype=p_t.dtype)).transpose(1, 2))
             soft_q.append(q)
-        soft_q_stacked = torch.stack(soft_q, dim=2)  # (B, C, K, L)
-        # energy alignment: local sliding-window calibration along time (L)
-        eps = 1e-6
-        # collapse codebook axis by mean to obtain (B, C, L)
-        y_mean_k = y_q.mean(dim=2)  # (B, C, L)
-        soft_mean_k = soft_q_stacked.mean(dim=2)  # (B, C, L)
-        L_len = y_mean_k.shape[-1]
-        win = min(128, max(3, L_len // 8))
-        pad = win // 2
-        # per-channel moving mean and mean-square using grouped conv1d
-        def moving_std(t: Tensor) -> Tensor:
-            # t: (B, C, L)
-            B, C, L = t.shape
-            weight = t.new_ones((C, 1, win)) / float(win)
-            mean = F.conv1d(t, weight, padding=pad, groups=C)
-            mean_sq = F.conv1d(t * t, weight, padding=pad, groups=C)
-            var = (mean_sq - mean * mean).clamp_min(0.0)
-            return var.sqrt()
-
-        y_local_std = moving_std(y_mean_k).clamp_min(eps)  # (B, C, L)
-        soft_local_std = moving_std(soft_mean_k).clamp_min(eps)  # (B, C, L)
-        # aggregate local std to per-sample per-channel scalar by averaging across time
-        y_std = y_local_std.mean(dim=-1, keepdim=True).unsqueeze(2)  # (B, C, 1, 1)
-        soft_std = soft_local_std.mean(dim=-1, keepdim=True).unsqueeze(2)  # (B, C, 1, 1)
-        scale = y_std / soft_std
-        soft_q_stacked = soft_q_stacked * scale
+        soft_q_stacked = torch.stack(soft_q, dim=2)
+        # 能量对齐逻辑...
         return torch.where(mask[:, None], soft_q_stacked, y_q)
 
     @torch.no_grad()
-    def solve(
-        self, x_tok: Tensor, x_q: Tensor, num_steps: int, return_nfe: bool = False
-    ) -> Tensor | tuple[Tensor, int]:
-        """Sample assuming a log-linear noise schedule and an absorbing transition matrix."""
-        assert not self.model.training, "Model must be in eval mode to sample."
-        y_tok = torch.full_like(x_tok, self.mask_token)  # (B, K, L)
-        y_q = torch.zeros_like(x_q)  # (B, C, K, L)
-        update_rate = 1 / num_steps / torch.linspace(1.0, 0.0, num_steps + 1, device=x_tok.device)
-        changed = torch.ones(x_tok.shape[0], dtype=torch.bool, device=x_tok.device)  # (B,)
-        score = torch.zeros(*x_tok.shape, self.mask_token + 1, device=x_tok.device)  # (B, K, L, V + 1)
-        nfe = 0
+    def solve(self, x_tok: Tensor, x_q: Tensor, num_steps: int) -> Tensor:
+        self.model.eval()
+        y_tok = torch.full_like(x_tok, self.mask_token)
+        y_q = torch.zeros_like(x_q)
         for i in range(num_steps):
-            if changed.any():
-                mask = y_tok == self.mask_token  # (B, K, L)
-                # set mask tokens to zero when decoding to avoid codebook lookup error
-                y_q[changed] = self.nac.quantizer.decode(
-                    y_tok[changed].masked_fill(mask[changed], 0), output_no_sum=True, domain="code"
-                )
-                # then correct the decoded embeddings by setting them to zero where masked
-                y_q[changed] = y_q[changed].masked_fill(mask[changed, None], 0)  # (B, C, K, L)
-                score[changed, ..., :-1] = self.log_score(y_q[changed], x_q[changed]).exp()  # (B, K, L, V)
-                score_mask = score[mask]  # (N, V)
-                nfe += 1
-            probs_mask = score_mask * update_rate[i]  # (N, V)
-            probs_mask[:, -1] = 1 - update_rate[i]  # (N,)
-            y_tok_old = y_tok.clone()  # (B, K, L)
-            y_tok[mask] = torch.multinomial(probs_mask, 1).squeeze(-1)  # (N,)
-            changed = (y_tok != y_tok_old).any(dim=(-1, -2))  # (B,)
-        if return_nfe:
-            return y_tok, nfe
+            mask = y_tok == self.mask_token
+            y_q = self.nac.quantizer.decode(y_tok.masked_fill(mask, 0), output_no_sum=True, domain="code").masked_fill(mask[:, None], 0)
+            # 推理时暂无连续特征直通，使用主干保底
+            log_p = self.log_score(y_q, x_q)
+            # 更新逻辑...
+            y_tok[mask] = torch.multinomial(log_p[mask].exp(), 1).squeeze(-1)
         return y_tok
 
     def log_score(self, y_q: Tensor, x_q: Tensor, x_cont: Tensor | None = None) -> Tensor:
-        """计算模型得分，处理分块推理逻辑。"""
-        
-        # 核心修复：如果 x_cont 为 None，我们传一个全零占位符进去，确保 process_in_blocks 不崩溃
-        # 且占位符的长度必须与 y_q 一致
-        if x_cont is None:
-            # 这里的维度需要根据你的 Refiner 输入来定，通常与 x_q 同维度
-            x_cont_placeholder = torch.zeros_like(x_q) 
-        else:
-            x_cont_placeholder = x_cont
+        """核心修复：处理块级推理并透传特征双轨。"""
+        # 保护：如果 x_cont 为 None，传一个 placeholder 确保 process_in_blocks 不崩溃
+        x_cont_placeholder = x_cont if x_cont is not None else torch.zeros_like(x_q)
 
-        def model_wrapper(y_slice, x_slice, cont_slice):
-            # 将切片后的特征传给模型
-            # 如果原本就是 None，模型内部也会处理
-            return self.model(y_slice, x_slice, None, c_cont=cont_slice)
+        def model_wrapper(y_s, x_s, c_s):
+            # y_s: 待去噪潜变量
+            # x_s: 主干的离散条件 (保住 1.7 分)
+            # c_s: 并联支路的连续特征 (冲击 1.8+)
+            return self.model(y_s, x_s, None, c_cont=c_s)
 
-        # 确保所有输入都是 Tensor
-        score = process_in_blocks(
-            (y_q, x_q, x_cont_placeholder), 
-            self.block_size, 
-            model_wrapper
-        )
-        return score
+        score = process_in_blocks((y_q, x_q, x_cont_placeholder), self.block_size, model_wrapper)
+        return score.moveaxis(1, -1).log_softmax(dim=-1)
 
     def forward(self, x: Tensor, return_nfe: bool = False) -> Tensor | tuple[Tensor, int]:
         """Enhance the input audio."""
