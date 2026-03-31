@@ -6,11 +6,18 @@ project_root = Path(__file__).parent.resolve()
 os.chdir(project_root)
 if str(project_root) not in sys.path: sys.path.insert(0, str(project_root))
 
-# 【关键操作】清理可能导致污染的旧日志目录
+
+# 【关键操作】清理可能导致污染的旧日志目录和旧数据库
 bad_log_dir = project_root / "logs" / "addse-s-edbase-parallel60-a008-p02-spec"
 if bad_log_dir.exists():
     print(f"--- 正在清理损坏的日志目录以防 PESQ 1.05 污染 ---")
     shutil.rmtree(bad_log_dir)
+
+# 强制删除旧的跑分数据库，彻底防止缓存污染
+bad_db = project_root / "v33_decoupled.db"
+if bad_db.exists():
+    print(f"--- 正在删除旧的跑分数据库 {bad_db.name} ---")
+    os.remove(bad_db)
 
 from addse.app.train import train as train_func
 from addse.app.eval import eval as eval_func
@@ -45,6 +52,8 @@ if __name__ == "__main__":
     ckpts = list(ckpt_dir.glob("*.ckpt"))
     if ckpts:
         best_ckpt = str(max(ckpts, key=lambda p: os.path.getmtime(p)))
+        # 注意这里加上了 overwrite=True
         eval_func(config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml", 
                   checkpoint=best_ckpt, output_dir="saved_audio_v33", 
-                  output_db="v33_decoupled.db", num_examples=60, clean=True, device="cuda")
+                  output_db="v33_decoupled.db", num_examples=60, clean=True, device="cuda", 
+                  overwrite=True)

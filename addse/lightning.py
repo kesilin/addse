@@ -578,7 +578,12 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.spec_loss = kwargs.get("spec_loss")
         self.spec_loss_weight = kwargs.get("spec_loss_weight", 0.0)
         self.optimizer, self.lr_scheduler = kwargs.get("optimizer"), kwargs.get("lr_scheduler")
+        # --- BaseLightningModule 兼容性补全 ---
         self.val_metrics = kwargs.get("val_metrics")
+        self.test_metrics = kwargs.get("test_metrics")
+        log_cfg = kwargs.get("log_cfg")
+        self.log_cfg = LogConfig() if log_cfg is None else log_cfg
+        self.debug_sample = kwargs.get("debug_sample")
         self.register_buffer("running_sdr", torch.tensor(1.0))
         self.sdr_ema_alpha, self.sdr_threshold = 0.95, -4.0
 
@@ -588,15 +593,16 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         # 1. 提取 Pre-VQ 连续细粮
         x_lat = self.nac.encoder(x)
         
-        # 2. 提取 Post-VQ 离散粗粮 (解决 ValueError)
+        # 2. 提取 Post-VQ 离散粗粮
         xy_tok, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=True, domain="q")
         x_tok, y_tok = xy_tok.chunk(2); x_q, y_q = xy_q.chunk(2)
 
         # 3. 传入 loss
         ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat)
-        
+
         if metrics or (stage == "val" and batch_idx == 0):
-            y_hat_tok = self.solve(x_tok, x_q, self.num_steps)
+            # 推理时也传递连续特征 x_lat
+            y_hat_tok = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
             y_hat = self.nac.decode(y_hat_tok, domain="code")
             return {"loss": ce_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
         return {"loss": ce_loss}, {}, {}
@@ -624,13 +630,17 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         return score.moveaxis(1, -1).log_softmax(dim=-1)
 
     @torch.no_grad()
-    def solve(self, x_tok, x_q, num_steps):
+    def solve(self, x_tok, x_q, num_steps, x_cont=None):
         y_tok = torch.full_like(x_tok, self.mask_token)
         for i in range(num_steps):
             mask = y_tok == self.mask_token
-            # 使用 NAC 内部方法避开维度陷阱
-            y_q = self.nac.encode_from_code(y_tok.masked_fill(mask, 0), no_sum=True, domain="q")[1].masked_fill(mask[:, None], 0)
-            log_p = self.log_score(y_q, x_q)
+            y_q = self.nac.quantizer.decode(
+                y_tok.masked_fill(mask, 0),
+                output_no_sum=True,
+                domain="code"
+            ).masked_fill(mask[:, None], 0)
+            # 推理时也传递 x_cont
+            log_p = self.log_score(y_q, x_q, x_cont=x_cont)
             y_tok[mask] = torch.multinomial(log_p[mask].exp(), 1).squeeze(-1)
         return y_tok
 
