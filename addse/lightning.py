@@ -266,17 +266,40 @@ class LightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     @override
     def step(
         self,
-        batch: tuple[Tensor, Tensor, Tensor],
+        batch: dict[str, Tensor],
         stage: str,
         batch_idx: int,
         metrics: Mapping[str, BaseMetric] | None = None,
-    ) -> tuple[dict[str, Tensor], dict[str, float], dict[str, Tensor]]:
-        x, y, _ = batch
-        y_hat = self.model(x)
-        loss = self.loss(y_hat, y)
-        metric_vals = compute_metrics(y_hat, y, metrics)
-        debug_samples = {"input": x, "reference": y, "output": y_hat} if self.current_epoch == 0 else {"output": y_hat}
-        return loss, metric_vals, debug_samples
+    ) -> tuple[Tensor, dict[str, Tensor], dict[str, Tensor]]:
+        x, y = batch["noisy"], batch["clean"]
+
+        # --- 核心改进：手动拆解 NAC 提取 Pre-VQ 连续特征 ---
+        # 提取 clean 的离散特征用于监督
+        y_lat = self.nac.encoder(y)
+        y_q, y_tok = self.nac.quantizer(y_lat)
+
+        # 提取 noisy 的特征：x_lat (连续细粮) 和 x_q (离散粗粮)
+        x_lat = self.nac.encoder(x)
+        x_q, x_tok = self.nac.quantizer(x_lat)
+
+        # 将 x_lat (Pre-VQ连续特征) 作为额外条件传给 loss
+        ce_loss, log_score, mask = self.loss(
+            x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat
+        )
+
+        # 后续重建与指标计算保持不变
+        y_hat_q = log_score.argmax(dim=1)
+        y_hat = self.nac.decoder(y_hat_q, y_tok)
+
+        metrics_dict = {}
+        if metrics is not None:
+            metrics_dict = metrics(y_hat, y)
+
+        loss = ce_loss
+        if self.spec_loss is not None:
+            loss = loss + self.spec_loss(y_hat, y)
+
+        return loss, metrics_dict, {"noisy": x, "clean": y, "enhanced": y_hat}
 
     def forward(self, x: Tensor) -> Tensor:
         """Enhance the input audio."""
@@ -359,13 +382,35 @@ class SGMSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             return loss, metric_vals, debug
         return loss, {}, {}
 
-    def loss(self, x: Tensor, y: Tensor) -> Tensor:
-        """Compute the loss."""
-        t = torch.rand(y.shape[0], dtype=y.real.dtype, device=y.device) * (1 - self.t_eps) + self.t_eps
-        sigma = self.sigma(t).reshape(-1, 1, 1, 1)
-        z = torch.randn_like(y)
-        y_t = (-self.gamma * t).exp().reshape(-1, 1, 1, 1) * (y - x) + x + sigma * z  # eq. (30-32)
-        return (sigma * self.score(x, y_t, t) + z).abs().pow(2).mean()  # eq. (33)
+    def loss(
+        self,
+        x_q: Tensor,
+        y_q: Tensor,
+        y_tok: Tensor,
+        return_intermediates: bool = False,
+        x_cont: Tensor | None = None,  # 新增连续特征参数
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
+        B, K, L = y_tok.shape
+        V = self.model.output_channels
+
+        # 生成扩散步 (lambda)
+        y_lambda_tok, mask = self.sample_step(y_tok)
+        y_lambda_q = self.nac.quantizer.from_indices(y_lambda_tok)
+
+        # 核心：将连续特征传给 log_score
+        log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
+
+        # 计算交叉熵
+        ce_loss = F.cross_entropy(
+            log_score.reshape(B * K * L, V),
+            y_tok.reshape(B * K * L),
+            reduction="none",
+        )
+        ce_loss = (ce_loss.reshape(B, K, L) * mask).sum() / mask.sum()
+
+        if return_intermediates:
+            return ce_loss, log_score, mask
+        return ce_loss
 
     def sigma(self, t: Tensor) -> Tensor:
         """Noise schedule."""
@@ -849,10 +894,29 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             return y_tok, nfe
         return y_tok
 
-    def log_score(self, y_q: Tensor, x_q: Tensor) -> Tensor:
-        """Estimate the score function."""
-        score = process_in_blocks((y_q, x_q), self.block_size, self.model)  # (B, V, K, L)
-        return score.moveaxis(1, -1).log_softmax(dim=-1)  # (B, K, L, V)
+    def log_score(self, y_q: Tensor, x_q: Tensor, x_cont: Tensor | None = None) -> Tensor:
+        """计算模型得分，处理分块推理逻辑。"""
+        
+        # 核心修复：如果 x_cont 为 None，我们传一个全零占位符进去，确保 process_in_blocks 不崩溃
+        # 且占位符的长度必须与 y_q 一致
+        if x_cont is None:
+            # 这里的维度需要根据你的 Refiner 输入来定，通常与 x_q 同维度
+            x_cont_placeholder = torch.zeros_like(x_q) 
+        else:
+            x_cont_placeholder = x_cont
+
+        def model_wrapper(y_slice, x_slice, cont_slice):
+            # 将切片后的特征传给模型
+            # 如果原本就是 None，模型内部也会处理
+            return self.model(y_slice, x_slice, None, c_cont=cont_slice)
+
+        # 确保所有输入都是 Tensor
+        score = process_in_blocks(
+            (y_q, x_q, x_cont_placeholder), 
+            self.block_size, 
+            model_wrapper
+        )
+        return score
 
     def forward(self, x: Tensor, return_nfe: bool = False) -> Tensor | tuple[Tensor, int]:
         """Enhance the input audio."""
