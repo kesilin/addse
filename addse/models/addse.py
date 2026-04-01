@@ -54,29 +54,31 @@ class ADDSERQDiT(nn.Module):
         return x_out.squeeze(2) if squeeze_output else x_out
 
 class ADDSERQDiTParallel(ADDSERQDiT):
-    """V3.4 QRC (Quantization Residual Compensation) 顶会架构
-    彻底解耦离散语义与连续高频残差，真正实现双轨并联。
+    """V3.5 QRC (Quantization Residual Compensation) 顶会级架构
+    采用 WaveNet 风格的空洞卷积，指数级扩大感受野，精准修复离散量化导致的高频与相位丢失。
     """
     def __init__(self, **kwargs) -> None:
-        self.input_channels = kwargs.get("input_channels")
-        self.adapter_hidden = kwargs.get("adapter_hidden", 256)
-        
-        # 过滤 kwargs 传给父类
+        # 过滤 kwargs 传递给父类
         base_kwargs = {k: v for k, v in kwargs.items() if k in ["input_channels", "output_channels", "num_codebooks", "hidden_dim", "num_layers", "num_heads", "max_seq_len", "conditional", "time_independent"]}
         super().__init__(**base_kwargs)
         
-        # 独立的连续残差预测网络 (1D CNN, 感受野指数级扩大以捕获相位)
-        self.refiner = nn.Sequential(
-            nn.Conv1d(self.input_channels, self.adapter_hidden, kernel_size=3, padding=1),
-            Snake1d(self.adapter_hidden),
-            nn.Conv1d(self.adapter_hidden, self.adapter_hidden, kernel_size=3, padding=2, dilation=2),
-            Snake1d(self.adapter_hidden),
-            nn.Conv1d(self.adapter_hidden, self.adapter_hidden, kernel_size=3, padding=4, dilation=4),
-            Snake1d(self.adapter_hidden),
-            nn.Conv1d(self.adapter_hidden, self.adapter_hidden, kernel_size=3, padding=8, dilation=8),
-            Snake1d(self.adapter_hidden),
-            nn.Conv1d(self.adapter_hidden, self.input_channels, kernel_size=1),
-        )
+        in_channels = kwargs.get("input_channels", 1024)
+        hidden = kwargs.get("adapter_hidden", 256)
+        
+        # 感受野 (Receptive Field) 指数级扩大的残差网络
+        layers = []
+        layers.append(nn.Conv1d(in_channels, hidden, 3, padding=1))
+        layers.append(nn.GELU())
+        # 使用空洞卷积 (Dilation) 捕捉长距离相位和上下文信息
+        for dilation in [1, 2, 4, 8, 16, 32]:
+            layers.append(nn.Conv1d(hidden, hidden, 3, padding=dilation, dilation=dilation))
+            layers.append(nn.GELU())
+        layers.append(nn.Conv1d(hidden, in_channels, 1))
+        self.refiner = nn.Sequential(*layers)
+        
+        # 交互参数：让连续残差动态辅助离散猜词
+        self.interaction_alpha = nn.Parameter(torch.zeros(1))
+        
         self._reset_parallel_parameters()
 
     def _reset_parallel_parameters(self) -> None:
@@ -84,17 +86,24 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             nn.init.zeros_(self.refiner[-1].weight)
             nn.init.zeros_(self.refiner[-1].bias)
 
-    def predict_residual(self, c_cont):
-        """并联支路使命：预测被离散量化器无情丢弃的高频残差"""
-        # 确保输入是连续特征 (B, C, L)
-        if c_cont.ndim == 4:
-            c_cont = c_cont.sum(dim=2) if c_cont.shape[2] > 1 else c_cont.squeeze(2)
-        return self.refiner(c_cont)
-
     def forward(self, x, c, t, c_cont=None):
-        # 离散主干绝对纯净！只负责粗粒度语义猜词，彻底摒弃交互污染
+        # 1. 主干离散网络预测语义 (猜词)
         z_base = super().forward(x, c, t) 
-        return z_base
+        
+        if c_cont is not None:
+            if c_cont.ndim == 4:
+                c_cont = c_cont.sum(dim=2) if c_cont.shape[2] > 1 else c_cont.squeeze(2)
+            
+            # 2. 连续支路预测高频量化残差！
+            residual_pred = self.refiner(c_cont) # (B, C, L)
+            
+            # 3. 平滑交互：将残差扩维后辅助修正分类概率
+            res_expanded = residual_pred.unsqueeze(2).expand_as(z_base)
+            logits = z_base + self.interaction_alpha * res_expanded
+            
+            return logits, residual_pred
+        else:
+            return z_base, None
 
 # 后续辅助类 ADDSEDiT, ADDSESelfAttentionBlock 等保持 Git 源码完整...
 class ADDSEDiT(nn.Module):

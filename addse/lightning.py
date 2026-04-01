@@ -82,8 +82,22 @@ class ConfigureOptimizersMixin(L.LightningModule):
             output["lr_scheduler"] = {k: v(optimizer) if k == "scheduler" else v for k, v in self.lr_scheduler.items()}
         return output
 
+# 支持返回 Tuple 的 process_in_blocks
+def process_in_blocks(args: tuple[Tensor, ...], block_size: int, fn: Callable[..., Any]) -> Any:
+    blocks = [fn(*(arg[..., i : i + block_size] for arg in args)) for i in range(0, args[0].shape[-1], block_size)]
+    if isinstance(blocks[0], tuple):
+        num_returns = len(blocks[0])
+        result = []
+        for j in range(num_returns):
+            if isinstance(blocks[0][j], Tensor):
+                result.append(torch.cat([b[j] for b in blocks], dim=-1))
+            else:
+                result.append(blocks[0][j])
+        return tuple(result)
+    return torch.cat(blocks, dim=-1)
+
 # ======================================================================
-# ADDSELightningModule (QRC 正交解耦版)
+# ADDSELightningModule (QRC 残差补偿彻底解耦版)
 # ======================================================================
 class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     def __init__(self, nac_cfg: str, nac_ckpt: str, model: ADDSERQDiT, num_steps: int, block_size: int, **kwargs) -> None:
@@ -98,83 +112,74 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.log_cfg = LogConfig() if log_cfg is None else log_cfg
         self.debug_sample = kwargs.get("debug_sample")
         
-        # 加载 1.7 分主干权重
         pretrained_ckpt = "logs/addse-edbase-quick/checkpoints/addse-s.ckpt" 
         import os
         if os.path.exists(pretrained_ckpt):
             print(f"--- 正在加载 1.7 分主干权重: {pretrained_ckpt} ---")
             ckpt_data = torch.load(pretrained_ckpt, map_location="cpu")
             state_dict = ckpt_data.get("state_dict", ckpt_data)
-            missing, unexpected = self.load_state_dict(state_dict, strict=False)
-            print(f"--- 权重加载完毕！连续并联残差网络已随机初始化，等待黄金特征监督 ---")
-        else:
-            print(f"⚠️ 未找到预训练权重 {pretrained_ckpt}，模型将从零开始！")
-
-    def loss(self, x_q, y_q, y_tok, return_intermediates=False, x_cont=None):
-        B, K, L = y_tok.shape
-        lambd = torch.rand(B, device=y_tok.device)
-        mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]
-        y_lambda_q = y_q.clone()
-        y_lambda_q.masked_fill_(mask[:, None], 0)
-        
-        log_score = self.log_score(y_lambda_q, x_q, x_cont=x_cont)
-        V = log_score.shape[-1]
-        loss = F.cross_entropy(log_score.reshape(-1, V), y_tok.reshape(-1), reduction="none")
-        loss = (loss.reshape(B, K, L) * mask).sum() / (mask.sum() + 1e-8)
-        return (loss, log_score, mask) if return_intermediates else loss
+            self.load_state_dict(state_dict, strict=False)
+            print(f"--- 权重加载完毕！QRC 连续支路已装载，准备捕获高频残差 ---")
 
     def log_score(self, y_q, x_q, x_cont=None):
         x_c_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
         def model_wrapper(y_s, x_s, c_s):
             return self.model(y_s, x_s, None, c_cont=c_s)
-        score = process_in_blocks((y_q, x_q, x_c_in), self.block_size, model_wrapper)
-        return score.moveaxis(1, -1).log_softmax(dim=-1)
+        
+        result = process_in_blocks((y_q, x_q, x_c_in), self.block_size, model_wrapper)
+        
+        if isinstance(result, tuple):
+            logits, residual = result
+            log_p = logits.moveaxis(1, -1).log_softmax(dim=-1)
+            return log_p, residual
+        else:
+            log_p = result.moveaxis(1, -1).log_softmax(dim=-1)
+            return log_p, None
 
     @override
     def step(self, batch, stage, batch_idx, metrics=None):
         x, y, _ = batch
-        
-        # 获取带噪和干净的原始连续隐特征 (x_lat & y_lat)
         x_lat = self.nac.encoder(x)
         with torch.no_grad():
-            y_lat = self.nac.encoder(y) # 黄金标尺：真正完美的高频连续特征！
+            y_lat_clean = self.nac.encoder(y) # 真正的黄金无损特征！
 
         xy_tok, xy_q = self.nac.encode(torch.cat([x, y]), no_sum=True, domain="q")
         x_tok, y_tok = xy_tok.chunk(2); x_q, y_q = xy_q.chunk(2)
 
-        # =========================================================
-        # 支路一 (离散主干): 专注猜词，计算分类损失 (CE Loss)
-        # =========================================================
-        ce_loss, log_score, mask = self.loss(x_q, y_q, y_tok, return_intermediates=True, x_cont=x_lat)
+        B, K, L = y_tok.shape
+        lambd = torch.rand(B, device=y_tok.device)
+        mask = torch.rand(y_tok.shape, device=y_tok.device) < lambd[:, None, None]
+        y_lambda_q = y_q.clone()
+        y_lambda_q.masked_fill_(mask.unsqueeze(1), 0)
+
+        # 核心前向传播
+        log_p, residual_pred = self.log_score(y_lambda_q, x_q, x_cont=x_lat)
+        
+        # 1. 离散 CE Loss (猜词)
+        V = log_p.shape[-1]
+        ce_loss = F.cross_entropy(log_p.reshape(-1, V), y_tok.reshape(-1), reduction="none")
+        ce_loss = (ce_loss.reshape(B, K, L) * mask).sum() / (mask.sum() + 1e-8)
         total_loss = ce_loss
         self.log(f"{stage}/ce_loss", ce_loss, prog_bar=True, sync_dist=True)
 
-        # =========================================================
-        # 支路二 (连续并联): 专注弥补高频，计算残差损失 (Res L1 Loss)
-        # =========================================================
-        if hasattr(self.model, "predict_residual"):
-            residual_pred = self.model.predict_residual(x_lat) # (B, C, L)
-            
-            # 计算被量化器无情抛弃的 "黄金残差" = 真实连续 - 真实量化
-            K = y_tok.shape[1]
+        # 2. 连续残差 Loss (补全高频相位)
+        if residual_pred is not None:
             y_q_sum = y_q.sum(dim=2) if y_q.ndim == 4 and y_q.shape[2] == K else y_q.sum(dim=1)
-            true_residual = (y_lat - y_q_sum).detach()
+            # 量化残差 (Residual) = 真实波形隐特征 - 量化破坏后的特征
+            true_residual = (y_lat_clean - y_q_sum).detach()
             
-            # 强迫并联支路学会提取高频残差！
             res_loss = F.l1_loss(residual_pred, true_residual)
-            total_loss = total_loss + 10.0 * res_loss # 权重可以给大点
+            total_loss = total_loss + 10.0 * res_loss
             self.log(f"{stage}/res_loss", res_loss, prog_bar=True, sync_dist=True)
 
         self.log(f"{stage}/loss", total_loss, prog_bar=False, sync_dist=True)
 
         if metrics or (stage == "val" and batch_idx == 0):
             y_lat_fused = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
-            
-            # 直接将最终完美的连续特征送给生成器
             if hasattr(self.nac, "generator"):
                 y_hat = self.nac.generator(y_lat_fused)
             else:
-                y_hat = self.nac.decode(y_lat_fused, domain="q")
+                y_hat = self.nac.decode(y_lat_fused, domain="lat") # 直接传给底层隐空间
                 
             y_hat = y_hat[..., :y.shape[-1]]
             return {"loss": total_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
@@ -184,20 +189,11 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     @torch.no_grad()
     def solve(self, x_tok, x_q, num_steps, x_cont=None):
         B, K, L = x_tok.shape
-        
-        # =========================================================
-        # 1. 连续支路：一键预测出丢失的高频相位残差！
-        # =========================================================
-        if hasattr(self.model, "predict_residual") and x_cont is not None:
-            residual_pred = self.model.predict_residual(x_cont)
-        else:
-            residual_pred = 0
-
-        # =========================================================
-        # 2. 离散主干：顽强地从噪声中还原出鲁棒的语义 Token
-        # =========================================================
         y_tok = torch.full_like(x_tok, self.mask_token)
         import math
+        final_residual = 0
+
+        # 主干扩散：猜词
         for i in range(num_steps):
             mask = y_tok == self.mask_token
             if not mask.any(): break
@@ -207,9 +203,14 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 if y_q_step.ndim == 4:
                     if y_q_step.shape[2] == x_q.shape[1]: y_q_step = y_q_step.transpose(1, 2)
                     elif y_q_step.shape[1] != x_q.shape[1]: y_q_step = y_q_step.reshape(x_q.shape)
-                    
             y_q_step = y_q_step.masked_fill(mask.unsqueeze(1), 0)
-            log_p = self.log_score(y_q_step, x_q, x_cont=x_cont)
+            
+            log_p, residual_pred = self.log_score(y_q_step, x_q, x_cont=x_cont)
+            
+            # 在最后一步保留对连续残差的预测
+            if i == num_steps - 1 and residual_pred is not None:
+                final_residual = residual_pred
+
             probs = log_p.exp()
             sampled_tokens = torch.multinomial(probs[mask], 1).squeeze(-1)
             y_tok_new = y_tok.clone()
@@ -233,34 +234,30 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 y_tok_new[new_mask] = self.mask_token
             y_tok = y_tok_new
 
-        # =========================================================
-        # 3. 顶会级正交融合 (Orthogonal Parallel Fusion)
-        # =========================================================
-        # 把最终猜出的离散 Token 解码成连续的基底特征
+        # ======================================================================
+        # 物理级终极融合 (Orthogonal Fusion)
+        # ======================================================================
         y_q_discrete = self.nac.quantizer.decode(y_tok, output_no_sum=False, domain="code")
         if y_q_discrete.ndim == 4:
             y_q_discrete = y_q_discrete.sum(dim=1) if y_q_discrete.shape[1] == K else y_q_discrete.sum(dim=2)
 
-        # 【核心魔法】：离散骨架 + 高频残差 = 突破天花板的完美特征
-        y_lat_fused = y_q_discrete + residual_pred
-        return y_lat_fused
+        # 干净的离散语义骨架 + 连续网络提取的高清相位残差 = 突破天花板的音质！
+        return y_q_discrete + final_residual
 
     def forward(self, x: torch.Tensor, return_nfe: bool = False, **kwargs):
         assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional"
         n_pad = (self.nac.downsampling_factor - x.shape[-1]) % self.nac.downsampling_factor
         x_pad = F.pad(x, (0, n_pad))
-        
         x_lat = self.nac.encoder(x_pad)
         x_tok, x_q = self.nac.encode(x_pad, no_sum=True, domain="q")
         
-        # solve 现在返回的是完美的结合特征 (B, C, L)
+        # solve 现在返回的是结合了高频残差的完美连续特征
         y_lat_fused = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
         
-        # 直接跨越量化器，把特征喂给最终的声码器/生成器！
         if hasattr(self.nac, "generator"):
             y_hat_pad = self.nac.generator(y_lat_fused)
         else:
-            y_hat_pad = self.nac.decode(y_lat_fused, domain="q")
+            y_hat_pad = self.nac.decode(y_lat_fused, domain="lat")
             
         y_hat = y_hat_pad[..., : y_hat_pad.shape[-1] - n_pad]
         if return_nfe: return y_hat, self.num_steps
@@ -369,7 +366,3 @@ def load_nac(cfg_path: str, ckpt_path: str) -> tuple[NAC, int]:
     nac.eval()
     for param in nac.parameters(): param.requires_grad = False
     return nac, nac.quantizer.codebooks[0].codebook.weight.shape[0]
-
-def process_in_blocks(args: tuple[Tensor, ...], block_size: int, fn: Callable[..., Tensor]) -> Tensor:
-    blocks = [fn(*(arg[..., i : i + block_size] for arg in args)) for i in range(0, args[0].shape[-1], block_size)]
-    return torch.cat(blocks, dim=-1)
