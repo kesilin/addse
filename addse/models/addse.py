@@ -54,43 +54,46 @@ class ADDSERQDiT(nn.Module):
         return x_out.squeeze(2) if squeeze_output else x_out
 
 class ADDSERQDiTParallel(ADDSERQDiT):
-    """V3.3 Evolved: 特征双轨制 + 输出侧修正架构。"""
+    """V3.4 QRC (Quantization Residual Compensation) 顶会架构
+    彻底解耦离散语义与连续高频残差，真正实现双轨并联。
+    """
     def __init__(self, **kwargs) -> None:
-        self.input_channels, self.adapter_hidden = kwargs.get("input_channels"), kwargs.get("adapter_hidden", 256)
-        self.alpha_max, self.interaction_alpha = kwargs.get("alpha_max", 0.08), kwargs.get("interaction_alpha", 0.1)
-        super().__init__(**{k: v for k, v in kwargs.items() if k in ["input_channels", "output_channels", "num_codebooks", "hidden_dim", "num_layers", "num_heads", "max_seq_len", "conditional", "time_independent"]})
+        self.input_channels = kwargs.get("input_channels")
+        self.adapter_hidden = kwargs.get("adapter_hidden", 256)
         
+        # 过滤 kwargs 传给父类
+        base_kwargs = {k: v for k, v in kwargs.items() if k in ["input_channels", "output_channels", "num_codebooks", "hidden_dim", "num_layers", "num_heads", "max_seq_len", "conditional", "time_independent"]}
+        super().__init__(**base_kwargs)
+        
+        # 独立的连续残差预测网络 (1D CNN, 感受野指数级扩大以捕获相位)
         self.refiner = nn.Sequential(
-            nn.Conv2d(self.input_channels, self.adapter_hidden, kernel_size=(3, 1), padding=(1, 0), dilation=1),
-            Snake1d(self.adapter_hidden), 
-            nn.Conv2d(self.adapter_hidden, self.adapter_hidden, kernel_size=(3, 1), padding=(2, 0), dilation=2),
+            nn.Conv1d(self.input_channels, self.adapter_hidden, kernel_size=3, padding=1),
             Snake1d(self.adapter_hidden),
-            nn.Conv2d(self.adapter_hidden, self.adapter_hidden, kernel_size=(3, 1), padding=(4, 0), dilation=4),
+            nn.Conv1d(self.adapter_hidden, self.adapter_hidden, kernel_size=3, padding=2, dilation=2),
             Snake1d(self.adapter_hidden),
-            nn.Conv2d(self.adapter_hidden, self.adapter_hidden, kernel_size=(3, 1), padding=(8, 0), dilation=8),
+            nn.Conv1d(self.adapter_hidden, self.adapter_hidden, kernel_size=3, padding=4, dilation=4),
             Snake1d(self.adapter_hidden),
-            nn.Conv2d(self.adapter_hidden, self.input_channels * 2, kernel_size=1),
+            nn.Conv1d(self.adapter_hidden, self.adapter_hidden, kernel_size=3, padding=8, dilation=8),
+            Snake1d(self.adapter_hidden),
+            nn.Conv1d(self.adapter_hidden, self.input_channels, kernel_size=1),
         )
-        self.gate_proj = nn.Conv2d(self.input_channels, self.input_channels, kernel_size=1)
         self._reset_parallel_parameters()
 
     def _reset_parallel_parameters(self) -> None:
         with torch.no_grad():
-            nn.init.zeros_(self.refiner[-1].weight); nn.init.zeros_(self.refiner[-1].bias)
-            nn.init.constant_(self.gate_proj.bias, -4.0)
+            nn.init.zeros_(self.refiner[-1].weight)
+            nn.init.zeros_(self.refiner[-1].bias)
+
+    def predict_residual(self, c_cont):
+        """并联支路使命：预测被离散量化器无情丢弃的高频残差"""
+        # 确保输入是连续特征 (B, C, L)
+        if c_cont.ndim == 4:
+            c_cont = c_cont.sum(dim=2) if c_cont.shape[2] > 1 else c_cont.squeeze(2)
+        return self.refiner(c_cont)
 
     def forward(self, x, c, t, c_cont=None):
-        # 1. 离散粗粮喂主干，保住 1.7 分
+        # 离散主干绝对纯净！只负责粗粒度语义猜词，彻底摒弃交互污染
         z_base = super().forward(x, c, t) 
-        
-        # 2. 连续细粮喂 Refiner，突破 1.8 分
-        c_ref = c_cont if c_cont is not None else c
-        if c_ref is not None:
-            c_4d = c_ref[:, :, None, :] if c_ref.ndim == 3 else c_ref
-            gamma, beta = self.refiner(c_4d).chunk(2, dim=1)
-            alpha_total = self.interaction_alpha * torch.sigmoid(self.gate_proj(c_4d))
-            if z_base.ndim == 3: alpha_total, gamma, beta = alpha_total.squeeze(2), gamma.squeeze(2), beta.squeeze(2)
-            return z_base + alpha_total * (torch.tanh(gamma) * z_base + beta)
         return z_base
 
 # 后续辅助类 ADDSEDiT, ADDSESelfAttentionBlock 等保持 Git 源码完整...
