@@ -1,4 +1,8 @@
-import os, sys, torch, shutil
+import argparse
+import os
+import shutil
+import sys
+import torch
 from pathlib import Path
 from hydra.core.global_hydra import GlobalHydra
 
@@ -10,17 +14,31 @@ from addse.app.train import train as train_func
 from addse.app.eval import eval as eval_func
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser("run_v33 short/full pipeline")
+    parser.add_argument("--train-epochs", type=int, default=10)
+    parser.add_argument("--train-batches", type=int, default=20)
+    parser.add_argument("--eval-examples", type=int, default=60)
+    parser.add_argument("--eval-steps", type=int, default=128, help="Diffusion steps during eval; use 128 for performance-caliber evaluation")
+    parser.add_argument("--val-every", type=int, default=1)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--reset-log-dir", action="store_true", help="Delete log dir before training")
+    parser.add_argument("--reset-db", action="store_true", help="Delete output DB before evaluation")
+    parser.add_argument("--deterministic-eval", action="store_true", help="Use deterministic token decoding during eval")
+    parser.add_argument("--output-db", type=str, default="v33_decoupled.db")
+    parser.add_argument("--output-dir", type=str, default="saved_audio_v33")
+    args = parser.parse_args()
+
     # ====================================================================
     # 【关键修复】必须放在 __main__ 里面！防止 Windows 多进程反复删除文件夹！
     # ====================================================================
     bad_log_dir = project_root / "logs" / "addse-s-edbase-parallel60-a008-p02-spec"
-    if bad_log_dir.exists():
+    if args.reset_log_dir and bad_log_dir.exists():
         print(f"--- 正在清理损坏的日志目录以防 PESQ 1.05 污染 ---")
         shutil.rmtree(bad_log_dir)
 
     # 强制删除旧的跑分数据库，彻底防止缓存污染
-    bad_db = project_root / "v33_decoupled.db"
-    if bad_db.exists():
+    bad_db = project_root / args.output_db
+    if args.reset_db and bad_db.exists():
         print(f"--- 正在删除旧的跑分数据库 {bad_db.name} ---")
         os.remove(bad_db)
     # ====================================================================
@@ -29,41 +47,49 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision('high')
         print(f"--- ADDSE V3.3 进化实验 (主干保护版) ---")
 
-    try:
-        train_func(
-            config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
-            overrides=[
-                # ==== 1. 训练轮次与数据量精准控制 ====
-                "++trainer.max_epochs=10",           # 跑 20 轮结束
-                "++trainer.limit_train_batches=20", # 100 个 batch * 8 = 800 组音频数据！
-                "++dm.train_dataloader.batch_size=8", 
-                
-                # ==== 2. 硬件加速（榨干性能，帮你省时间） ====
-                "++dm.train_dataloader.num_workers=8",   # 开启多线程读数据，别让 GPU 等 CPU
-                "++dm.train_dataloader.pin_memory=true", # 内存锁页，加速传输
-                
-                # ==== 3. 验证与杂项配置 ====
-                "++trainer.check_val_every_n_epoch=2",   # 每 2 轮跑一次测试（省点测试的时间）
-                "++dm.train_dataset.resume=false",
-                "++dm.val_dataset.resume=false",
-                "++model.metrics=true",
-                "++model.interaction_alpha=0.01", 
-                
-                # ==== 4. 学习率控制 ====
-                "++optimizer.lr=5e-5", # 既然数据少了，学习率可以稍微放大一点点，加速收敛
-            ],
-            overwrite=True, wandb=False
-        )
-    except Exception as e:
-        import traceback; traceback.print_exc()
+    train_func(
+        config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
+        overrides=[
+            # ==== 1. 训练轮次与数据量精准控制 ====
+            f"++trainer.max_epochs={args.train_epochs}",
+            f"++trainer.limit_train_batches={args.train_batches}",
+            "++dm.train_dataloader.batch_size=8",
+                f"++dm.train_dataset.length={max(args.train_batches * 8, 320)}",
+
+            # ==== 2. 硬件加速（榨干性能，帮你省时间） ====
+            "++dm.train_dataloader.num_workers=8",   # 开启多线程读数据，别让 GPU 等 CPU
+            "++dm.train_dataloader.pin_memory=true", # 内存锁页，加速传输
+
+            # ==== 3. 验证与杂项配置 ====
+            f"++trainer.check_val_every_n_epoch={args.val_every}",
+            "++dm.train_dataset.resume=false",
+            "++dm.val_dataset.resume=false",
+        ],
+        overwrite=args.reset_log_dir, wandb=False
+    )
 
     GlobalHydra.instance().clear() 
     ckpt_dir = project_root / "logs" / "addse-s-edbase-parallel60-a008-p02-spec" / "checkpoints"
-    ckpts = list(ckpt_dir.glob("*.ckpt"))
+    ckpts = list(ckpt_dir.glob("*.ckpt")) if ckpt_dir.exists() else []
     if ckpts:
         best_ckpt = str(max(ckpts, key=lambda p: os.path.getmtime(p)))
         print(f"--- 正在使用最佳权重进行评估: {best_ckpt} ---")
-        eval_func(config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml", 
-                  checkpoint=best_ckpt, output_dir="saved_audio_v33", 
-                  output_db="v33_decoupled.db", num_examples=60, clean=True, device="cuda", 
-                  overwrite=True)
+        eval_func(
+            config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
+            checkpoint=best_ckpt,
+            overrides=[
+                f"lm.num_steps={args.eval_steps}",
+                f"eval.dsets.edbase-local.length={args.eval_examples}",
+                f"lm.deterministic_eval={str(args.deterministic_eval).lower()}",
+            ],
+            output_dir=args.output_dir,
+            output_db=args.output_db,
+            num_examples=args.eval_examples,
+            noisy=True,
+            clean=True,
+            device=args.device,
+            overwrite=True,
+            num_consumers=0,
+        )
+    else:
+        print("--- 未找到 checkpoint，跳过评估。请检查 trainer 回调与验证频率。---")

@@ -13,7 +13,7 @@ import torch
 import typer
 from dotenv import load_dotenv
 from hydra.utils import instantiate
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
 
 from ..data import DynamicMixingDataset
@@ -136,6 +136,11 @@ def eval(
             if not os.path.exists(ckpt):
                 print(f"Checkpoint '{ckpt}' does not exist. Skipping evaluation for {name}.")
                 continue
+
+            # When a full model checkpoint is explicitly provided, avoid redundant base preload.
+            if isinstance(cfg.lm, DictConfig) and cfg.lm.get("pretrained_ckpt"):
+                with open_dict(cfg):
+                    cfg.lm.pretrained_ckpt = None
 
             lm: BaseLightningModule = instantiate(cfg.lm)
             lm.to(device)

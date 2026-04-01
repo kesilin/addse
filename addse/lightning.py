@@ -1,12 +1,15 @@
 import functools
 import math
+import os
 import re
+import warnings
 from abc import abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any, override
 
 import lightning as L
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,6 +25,32 @@ from .losses import BaseLoss
 from .metrics import BaseMetric
 from .models import ADM, NAC, ADDSERQDiT, SGMSEUNet
 from .stft import STFT
+
+try:
+    from pesq import BufferTooShortError, NoUtterancesError, pesq
+except Exception:  # pragma: no cover
+    BufferTooShortError = NoUtterancesError = Exception
+    pesq = None
+
+
+class MetricDiscriminator(nn.Module):
+    def __init__(self, in_channels: int = 2, hidden: int = 32) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(in_channels, hidden, kernel_size=7, stride=2, padding=3),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(hidden, hidden * 2, kernel_size=7, stride=2, padding=3),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(hidden * 2, hidden * 2, kernel_size=5, stride=2, padding=2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.AdaptiveAvgPool1d(1),
+        )
+        self.head = nn.Linear(hidden * 2, 1)
+
+    def forward(self, y_hat: Tensor, y_ref: Tensor) -> Tensor:
+        x = torch.cat([y_hat, y_ref], dim=1)
+        h = self.net(x).squeeze(-1)
+        return torch.sigmoid(self.head(h))
 
 @dataclass
 class LogConfig:
@@ -105,21 +134,67 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.nac, self.mask_token = load_nac(nac_cfg, nac_ckpt)
         self.model, self.num_steps, self.block_size = model, num_steps, block_size
         self.optimizer, self.lr_scheduler = kwargs.get("optimizer"), kwargs.get("lr_scheduler")
+        self.spec_loss: BaseLoss | None = kwargs.get("spec_loss")
+        self.spec_loss_weight = float(kwargs.get("spec_loss_weight", 0.0))
+        self.si_sdr_weight = float(kwargs.get("si_sdr_weight", 0.0))
+        self.residual_cos_weight = float(kwargs.get("residual_cos_weight", 0.0))
+        self.residual_std_weight = float(kwargs.get("residual_std_weight", 0.0))
+        self.residual_ema_decay = float(kwargs.get("residual_ema_decay", 0.8))
+        self.quality_branch_weight = float(kwargs.get("quality_branch_weight", 0.0))
+        self.quality_smooth_weight = float(kwargs.get("quality_smooth_weight", 0.0))
+        self.fidelity_gate_enabled = bool(kwargs.get("fidelity_gate_enabled", True))
+        self.fidelity_gate_min = float(kwargs.get("fidelity_gate_min", 0.15))
+        self.fidelity_gate_max = float(kwargs.get("fidelity_gate_max", 1.0))
+        self.fidelity_conf_threshold = float(kwargs.get("fidelity_conf_threshold", 0.75))
+        self.fidelity_conf_sharpness = float(kwargs.get("fidelity_conf_sharpness", 10.0))
+        self.fidelity_energy_ref = float(kwargs.get("fidelity_energy_ref", 0.25))
+        self.deterministic_eval = bool(kwargs.get("deterministic_eval", False))
+        self.metricgan_plus_enabled = bool(kwargs.get("metricgan_plus_enabled", False))
+        self.metricgan_weight = float(kwargs.get("metricgan_weight", 0.0))
+        self.metricgan_disc_lr = float(kwargs.get("metricgan_disc_lr", 1e-4))
+        self.metricgan_update_every = int(kwargs.get("metricgan_update_every", 8))
+        self.metricgan_start_step = int(kwargs.get("metricgan_start_step", 100))
+        self.metricgan_batch_items = int(kwargs.get("metricgan_batch_items", 1))
         
         self.val_metrics = kwargs.get("val_metrics")
         self.test_metrics = kwargs.get("test_metrics")
         log_cfg = kwargs.get("log_cfg")
         self.log_cfg = LogConfig() if log_cfg is None else log_cfg
         self.debug_sample = kwargs.get("debug_sample")
+
+        self.metric_discriminator: MetricDiscriminator | None = None
+        self.metric_disc_optimizer: Adam | None = None
+        if self.metricgan_plus_enabled:
+            self.metric_discriminator = MetricDiscriminator()
+            self.metric_disc_optimizer = Adam(self.metric_discriminator.parameters(), lr=self.metricgan_disc_lr)
+
+        trainable_param_patterns = kwargs.get("trainable_param_patterns")
+        if trainable_param_patterns:
+            self._apply_trainable_param_patterns(trainable_param_patterns)
         
-        pretrained_ckpt = "logs/addse-edbase-quick/checkpoints/addse-s.ckpt" 
-        import os
-        if os.path.exists(pretrained_ckpt):
-            print(f"--- 正在加载 1.7 分主干权重: {pretrained_ckpt} ---")
+        pretrained_ckpt = kwargs.get("pretrained_ckpt")
+        if pretrained_ckpt:
+            if not os.path.exists(pretrained_ckpt):
+                raise FileNotFoundError(f"Configured pretrained_ckpt does not exist: {pretrained_ckpt}")
+            print(f"--- 显式预加载主干权重: {pretrained_ckpt} ---")
             ckpt_data = torch.load(pretrained_ckpt, map_location="cpu")
             state_dict = ckpt_data.get("state_dict", ckpt_data)
-            self.load_state_dict(state_dict, strict=False)
-            print(f"--- 权重加载完毕！QRC 连续支路已装载，准备捕获高频残差 ---")
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            print(f"--- 预加载完成 (missing={len(missing)}, unexpected={len(unexpected)}) ---")
+
+    def _apply_trainable_param_patterns(self, patterns: Iterable[str]) -> None:
+        normalized = [p for p in patterns if isinstance(p, str) and p.strip()]
+        if not normalized:
+            return
+        for _, p in self.model.named_parameters():
+            p.requires_grad = False
+        matched = 0
+        for name, p in self.model.named_parameters():
+            if any(pattern in name for pattern in normalized):
+                p.requires_grad = True
+                matched += 1
+        if matched == 0:
+            raise ValueError(f"No model parameters matched trainable_param_patterns: {normalized}")
 
     def log_score(self, y_q, x_q, x_cont=None):
         x_c_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
@@ -129,12 +204,45 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         result = process_in_blocks((y_q, x_q, x_c_in), self.block_size, model_wrapper)
         
         if isinstance(result, tuple):
-            logits, residual = result
+            if len(result) == 3:
+                logits, residual, quality_map = result
+            else:
+                logits, residual = result
+                quality_map = None
             log_p = logits.moveaxis(1, -1).log_softmax(dim=-1)
-            return log_p, residual
+            return log_p, residual, quality_map
         else:
             log_p = result.moveaxis(1, -1).log_softmax(dim=-1)
-            return log_p, None
+            return log_p, None, None
+
+    @staticmethod
+    def _si_sdr_loss(pred: Tensor, target: Tensor, eps: float = 1e-8) -> Tensor:
+        pred = pred - pred.mean(dim=-1, keepdim=True)
+        target = target - target.mean(dim=-1, keepdim=True)
+        proj = (pred * target).sum(dim=-1, keepdim=True) * target / (target.pow(2).sum(dim=-1, keepdim=True) + eps)
+        noise = pred - proj
+        ratio = proj.pow(2).sum(dim=-1) / (noise.pow(2).sum(dim=-1) + eps)
+        si_sdr = 10.0 * torch.log10(ratio + eps)
+        return -si_sdr.mean()
+
+    def _pesq_target(self, pred: Tensor, target: Tensor, max_items: int = 1) -> Tensor:
+        if pesq is None:
+            return torch.full((min(pred.shape[0], max_items), 1), 0.5, device=pred.device, dtype=pred.dtype)
+
+        scores: list[float] = []
+        n = min(pred.shape[0], max_items)
+        pred_np = pred[:n].detach().cpu().numpy()
+        target_np = target[:n].detach().cpu().numpy()
+        for i in range(n):
+            try:
+                s = pesq(16000, target_np[i, 0], pred_np[i, 0], "wb")
+            except (BufferTooShortError, NoUtterancesError, ValueError) as e:
+                warnings.warn(f"MetricGAN+ PESQ target fallback: {e}")
+                s = 1.0
+            # Normalize PESQ(roughly 1.0~4.5) to [0,1]
+            s_norm = max(0.0, min(1.0, (float(s) - 1.0) / 3.5))
+            scores.append(s_norm)
+        return torch.tensor(scores, device=pred.device, dtype=pred.dtype).view(-1, 1)
 
     @override
     def step(self, batch, stage, batch_idx, metrics=None):
@@ -153,7 +261,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         y_lambda_q.masked_fill_(mask.unsqueeze(1), 0)
 
         # 核心前向传播
-        log_p, residual_pred = self.log_score(y_lambda_q, x_q, x_cont=x_lat)
+        log_p, residual_pred, quality_pred = self.log_score(y_lambda_q, x_q, x_cont=x_lat)
         
         # 1. 离散 CE Loss (猜词)
         V = log_p.shape[-1]
@@ -172,6 +280,88 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             total_loss = total_loss + 10.0 * res_loss
             self.log(f"{stage}/res_loss", res_loss, prog_bar=True, sync_dist=True)
 
+            if self.residual_cos_weight > 0:
+                res_cos = 1.0 - F.cosine_similarity(
+                    residual_pred.flatten(1), true_residual.flatten(1), dim=1
+                ).mean()
+                total_loss = total_loss + self.residual_cos_weight * res_cos
+                self.log(f"{stage}/res_cos_loss", res_cos, prog_bar=False, sync_dist=True)
+
+            if self.residual_std_weight > 0:
+                pred_std = residual_pred.std(dim=-1).mean(dim=1)
+                tgt_std = true_residual.std(dim=-1).mean(dim=1)
+                res_std = F.l1_loss(pred_std, tgt_std)
+                total_loss = total_loss + self.residual_std_weight * res_std
+                self.log(f"{stage}/res_std_loss", res_std, prog_bar=False, sync_dist=True)
+
+            if quality_pred is not None and self.quality_branch_weight > 0:
+                local_err = (residual_pred.detach() - true_residual).abs().mean(dim=1, keepdim=True)
+                err_ref = local_err.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+                quality_target = torch.exp(-local_err / err_ref).clamp(min=0.0, max=1.0)
+                quality_loss = F.l1_loss(quality_pred, quality_target)
+                total_loss = total_loss + self.quality_branch_weight * quality_loss
+                self.log(f"{stage}/quality_loss", quality_loss, prog_bar=False, sync_dist=True)
+
+                if self.quality_smooth_weight > 0 and quality_pred.shape[-1] > 1:
+                    q_smooth = (quality_pred[..., 1:] - quality_pred[..., :-1]).abs().mean()
+                    total_loss = total_loss + self.quality_smooth_weight * q_smooth
+                    self.log(f"{stage}/quality_smooth", q_smooth, prog_bar=False, sync_dist=True)
+
+            if self.spec_loss is not None and self.spec_loss_weight > 0:
+                pred_lat = y_q_sum + residual_pred
+                if hasattr(self.nac, "generator"):
+                    y_pred = self.nac.generator(pred_lat)
+                else:
+                    y_pred = self.nac.decode(pred_lat, no_sum=False, domain="q")
+                y_pred = y_pred[..., : y.shape[-1]]
+                spec_losses = self.spec_loss(y_pred, y)
+                spec_main = spec_losses["loss"]
+                total_loss = total_loss + self.spec_loss_weight * spec_main
+                self.log(f"{stage}/spec_loss", spec_main, prog_bar=True, sync_dist=True)
+
+                if self.si_sdr_weight > 0:
+                    si_sdr_loss = self._si_sdr_loss(y_pred, y)
+                    total_loss = total_loss + self.si_sdr_weight * si_sdr_loss
+                    self.log(f"{stage}/si_sdr_loss", si_sdr_loss, prog_bar=True, sync_dist=True)
+
+                if (
+                    stage == "train"
+                    and self.metricgan_plus_enabled
+                    and self.metric_discriminator is not None
+                    and self.metric_disc_optimizer is not None
+                    and self.metricgan_weight > 0
+                ):
+                    self.metric_discriminator.to(y_pred.device)
+                    should_update_disc = (
+                        self.global_step >= self.metricgan_start_step
+                        and self.metricgan_update_every > 0
+                        and (self.global_step % self.metricgan_update_every == 0)
+                    )
+
+                    metric_items = max(1, self.metricgan_batch_items)
+                    y_sub = y[:metric_items]
+                    y_pred_sub = y_pred[:metric_items]
+
+                    if should_update_disc:
+                        with torch.no_grad():
+                            metric_target = self._pesq_target(y_pred_sub, y_sub, max_items=metric_items)
+                        disc_pred = self.metric_discriminator(y_pred_sub.detach(), y_sub.detach())
+                        disc_loss = F.mse_loss(disc_pred, metric_target)
+                        self.metric_disc_optimizer.zero_grad(set_to_none=True)
+                        disc_loss.backward()
+                        self.metric_disc_optimizer.step()
+                        self.log(f"{stage}/metric_disc_loss", disc_loss.detach(), prog_bar=False, sync_dist=True)
+
+                    for p in self.metric_discriminator.parameters():
+                        p.requires_grad_(False)
+                    metric_reward = self.metric_discriminator(y_pred_sub, y_sub).mean()
+                    metric_gen_loss = -metric_reward
+                    total_loss = total_loss + self.metricgan_weight * metric_gen_loss
+                    self.log(f"{stage}/metric_reward", metric_reward.detach(), prog_bar=True, sync_dist=True)
+                    self.log(f"{stage}/metric_gen_loss", metric_gen_loss.detach(), prog_bar=False, sync_dist=True)
+                    for p in self.metric_discriminator.parameters():
+                        p.requires_grad_(True)
+
         self.log(f"{stage}/loss", total_loss, prog_bar=False, sync_dist=True)
 
         if metrics or (stage == "val" and batch_idx == 0):
@@ -179,7 +369,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             if hasattr(self.nac, "generator"):
                 y_hat = self.nac.generator(y_lat_fused)
             else:
-                y_hat = self.nac.decode(y_lat_fused, domain="lat") # 直接传给底层隐空间
+                y_hat = self.nac.decode(y_lat_fused, no_sum=False, domain="q")
                 
             y_hat = y_hat[..., :y.shape[-1]]
             return {"loss": total_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
@@ -191,7 +381,8 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         B, K, L = x_tok.shape
         y_tok = torch.full_like(x_tok, self.mask_token)
         import math
-        final_residual = 0
+        final_residual = None
+        final_confidence = None
 
         # 主干扩散：猜词
         for i in range(num_steps):
@@ -205,14 +396,22 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                     elif y_q_step.shape[1] != x_q.shape[1]: y_q_step = y_q_step.reshape(x_q.shape)
             y_q_step = y_q_step.masked_fill(mask.unsqueeze(1), 0)
             
-            log_p, residual_pred = self.log_score(y_q_step, x_q, x_cont=x_cont)
+            log_p, residual_pred, _ = self.log_score(y_q_step, x_q, x_cont=x_cont)
             
-            # 在最后一步保留对连续残差的预测
-            if i == num_steps - 1 and residual_pred is not None:
-                final_residual = residual_pred
+            # 用 EMA 聚合多步连续残差，减少只取最后一步导致的细节丢失。
+            if residual_pred is not None:
+                if final_residual is None:
+                    final_residual = residual_pred
+                else:
+                    decay = min(max(self.residual_ema_decay, 0.0), 0.99)
+                    final_residual = decay * final_residual + (1.0 - decay) * residual_pred
 
             probs = log_p.exp()
-            sampled_tokens = torch.multinomial(probs[mask], 1).squeeze(-1)
+            final_confidence = probs.max(dim=-1).values.mean(dim=(1, 2), keepdim=True)
+            if self.deterministic_eval and not self.training:
+                sampled_tokens = probs.argmax(dim=-1)[mask]
+            else:
+                sampled_tokens = torch.multinomial(probs[mask], 1).squeeze(-1)
             y_tok_new = y_tok.clone()
             y_tok_new[mask] = sampled_tokens
             
@@ -241,8 +440,32 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         if y_q_discrete.ndim == 4:
             y_q_discrete = y_q_discrete.sum(dim=1) if y_q_discrete.shape[1] == K else y_q_discrete.sum(dim=2)
 
-        # 干净的离散语义骨架 + 连续网络提取的高清相位残差 = 突破天花板的音质！
-        return y_q_discrete + final_residual
+        if isinstance(final_residual, Tensor) and self.fidelity_gate_enabled:
+            # 保真门：置信度越高、残差能量越低，连续分支注入越强；否则自动收缩，保护主干语义与时域保真。
+            base_rms = y_q_discrete.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-8)
+            res_rms = final_residual.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-8)
+            energy_ratio = res_rms / base_rms
+            energy_gate = torch.exp(-energy_ratio / max(self.fidelity_energy_ref, 1e-6))
+
+            if final_confidence is None:
+                conf_gate = torch.ones((B, 1, 1), device=y_q_discrete.device, dtype=y_q_discrete.dtype)
+            else:
+                conf_gate = torch.sigmoid(
+                    self.fidelity_conf_sharpness * (final_confidence.to(y_q_discrete.dtype) - self.fidelity_conf_threshold)
+                )
+
+            fidelity_gate = torch.clamp(
+                conf_gate * energy_gate,
+                min=self.fidelity_gate_min,
+                max=self.fidelity_gate_max,
+            )
+            self._last_fidelity_gate_mean = float(fidelity_gate.mean().item())
+            return y_q_discrete + fidelity_gate * final_residual
+
+        # 干净的离散语义骨架 + 连续网络提取的高清相位残差
+        if isinstance(final_residual, Tensor):
+            return y_q_discrete + final_residual
+        return y_q_discrete
 
     def forward(self, x: torch.Tensor, return_nfe: bool = False, **kwargs):
         assert x.ndim == 3, f"{type(self).__name__} input must be 3-dimensional"
@@ -257,7 +480,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         if hasattr(self.nac, "generator"):
             y_hat_pad = self.nac.generator(y_lat_fused)
         else:
-            y_hat_pad = self.nac.decode(y_lat_fused, domain="lat")
+            y_hat_pad = self.nac.decode(y_lat_fused, no_sum=False, domain="q")
             
         y_hat = y_hat_pad[..., : y_hat_pad.shape[-1] - n_pad]
         if return_nfe: return y_hat, self.num_steps

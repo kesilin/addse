@@ -13,6 +13,7 @@ lm:
   _target_: addse.lightning.ADDSELightningModule
   nac_cfg: configs/nac.yaml
   nac_ckpt: logs/nac/checkpoints/last.ckpt
+  pretrained_ckpt: logs/addse-edbase-quick/checkpoints/addse-s.ckpt
   model:
     _target_: addse.models.ADDSERQDiTParallel
     input_channels: 1024
@@ -24,7 +25,7 @@ lm:
     max_seq_len: 1024
     conditional: true
     time_independent: true
-    interaction_alpha: 0.05
+    interaction_alpha: 0.012
     adapter_hidden: 256
     fusion_mode: add
     use_adain_align: true
@@ -32,8 +33,13 @@ lm:
     gate_kernel_size: 3
     use_pitch_aware_gate: true
     pitch_gain: 0.2
+    use_interaction_alignment_gate: true
+    use_interaction_confidence_gate: true
+    use_band_quality_gate: true
+    interaction_gate_floor: 0.2
+    quality_head_hidden: 128
     dynamic_alpha: true
-    alpha_max: 0.08
+    alpha_max: 0.04
     use_fusion_norm: false
   spec_loss:
     _target_: addse.losses.MSMelSpecLoss
@@ -41,13 +47,32 @@ lm:
     frame_lengths: [127, 257, 509, 1021]
     n_mels: [32, 64, 128, 256]
   spec_loss_weight: 0.05
-  trainable_param_patterns: ["adapter", "gate_proj", "parallel_proj", "freq_gate", "alpha_proj", "output_proj"]
+  si_sdr_weight: 0.02
+  residual_cos_weight: 0.1
+  residual_std_weight: 0.04
+  residual_ema_decay: 0.8
+  quality_branch_weight: 0.1
+  quality_smooth_weight: 0.02
+  fidelity_gate_enabled: true
+  fidelity_gate_min: 0.2
+  fidelity_gate_max: 0.6
+  fidelity_conf_threshold: 0.75
+  fidelity_conf_sharpness: 10.0
+  fidelity_energy_ref: 0.2
+  deterministic_eval: true
+  metricgan_plus_enabled: false
+  metricgan_weight: 0.0
+  metricgan_disc_lr: 1.0e-4
+  metricgan_update_every: 8
+  metricgan_start_step: 100
+  metricgan_batch_items: 1
+  trainable_param_patterns: ["refiner", "freq_gate", "pitch_gate", "alpha_proj", "parallel_proj", "interaction_alpha"]
   num_steps: 128
   block_size: 200
   optimizer:
     _target_: torch.optim.AdamW
     _partial_: true
-    lr: 1.0e-4
+    lr: 6.0e-5
     eps: 1.0e-7
   debug_sample: [0, 0]
 
@@ -56,7 +81,7 @@ dm:
   train_dataset:
     _target_: addse.data.DynamicMixingDataset
     _partial_: true
-    length: 60
+    length: 320
     resume: true
     reset_rngs: false
     snr_range: [0.0, 10.0]
@@ -77,7 +102,7 @@ dm:
   val_dataset:
     _target_: addse.data.DynamicMixingDataset
     _partial_: true
-    length: 20
+    length: 40
     resume: false
     reset_rngs: true
     snr_range: [0.0, 10.0]
@@ -139,18 +164,22 @@ eval:
         fs: ${fs}
         segment_length: 1.0
         max_length: null
-        shuffle: true
+        shuffle: false
       noise_dataset:
         _target_: addse.data.AudioStreamingDataset
         input_dir: ${train_noise_chunks}
         fs: ${fs}
         segment_length: 1.0
         max_length: null
-        shuffle: true
+        shuffle: false
   metrics:
     sdr:
       _target_: addse.metrics.SDRMetric
       scale_invariant: false
+    si_sdr:
+      _target_: addse.metrics.SDRMetric
+      scale_invariant: true
+      zero_mean: true
     estoi:
       _target_: addse.metrics.STOIMetric
       fs: ${fs}

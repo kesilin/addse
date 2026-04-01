@@ -160,6 +160,13 @@ def train(
 
         seed_all(cfg.seed)
 
+        lm_pretrained_ckpt = cfg.lm.get("pretrained_ckpt") if isinstance(cfg.lm, DictConfig) else None
+        if init_ckpt is not None and lm_pretrained_ckpt:
+            raise ValueError(
+                "Both lm.pretrained_ckpt and --init-ckpt are set. "
+                "Please keep only one initialization source to avoid checkpoint contamination."
+            )
+
         lm: BaseLightningModule = instantiate(cfg.lm)
         if init_ckpt is not None:
             if not os.path.exists(init_ckpt):
