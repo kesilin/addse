@@ -17,6 +17,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("run_v33 short/full pipeline")
     parser.add_argument("--train-epochs", type=int, default=10)
     parser.add_argument("--train-batches", type=int, default=5)
+    parser.add_argument("--train-groups", type=int, default=150, help="Synthetic training groups / dataset length")
     parser.add_argument("--eval-examples", type=int, default=60)
     parser.add_argument("--eval-steps", type=int, default=200, help="Diffusion steps during eval; use 200 for strict evaluation")
     parser.add_argument("--val-every", type=int, default=1)
@@ -54,7 +55,16 @@ if __name__ == "__main__":
             f"++trainer.max_epochs={args.train_epochs}",
             f"++trainer.limit_train_batches={args.train_batches}",
             "++dm.train_dataloader.batch_size=8",
-                f"++dm.train_dataset.length={max(args.train_batches * 8, 320)}",
+            f"++dm.train_dataset.length={max(args.train_groups, args.train_batches * 8)}",
+
+            # ==== 1.1 P-SSA 训练超参（从 Oracle 过渡到真实训练） ====
+            "++lm.spec_loss_weight=1.0",
+            "++lm.wave_l1_weight=2.0",
+            "++lm.si_sdr_weight=0.5",
+            "++lm.metricgan_plus_enabled=false",
+            "++lm.metricgan_weight=0.0",
+            "++lm.wave_residual_multiscale=true",
+            "++lm.wave_residual_low_stride=8",
 
             # ==== 2. 硬件加速（榨干性能，帮你省时间） ====
             "++dm.train_dataloader.num_workers=8",   # 开启多线程读数据，别让 GPU 等 CPU

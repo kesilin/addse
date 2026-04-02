@@ -177,7 +177,12 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.wave_residual_layers = int(kwargs.get("wave_residual_layers", 4))
         self.wave_residual_repeats = int(kwargs.get("wave_residual_repeats", 2))
         self.wave_residual_causal = bool(kwargs.get("wave_residual_causal", False))
+        self.wave_residual_multiscale = bool(kwargs.get("wave_residual_multiscale", True))
+        self.wave_residual_low_stride = int(kwargs.get("wave_residual_low_stride", 8))
         self.wave_residual_net: nn.Module | None = None
+        self.wave_residual_low_head: nn.Conv1d | None = None
+        self.wave_residual_high_head: nn.Conv1d | None = None
+        self.alphas: nn.Parameter | None = None
         if self.wave_residual_enabled:
             wave_norm = functools.partial(nn.BatchNorm1d, momentum=0.1)
             self.wave_residual_net = ConvTasNet(
@@ -195,8 +200,15 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 causal=self.wave_residual_causal,
                 norm=wave_norm,
             )
-            # 可学习的融合系数：logit(0.01) 使 sigmoid(alpha) 初始约为 0.01
-            self.wave_residual_alpha_scale = nn.Parameter(torch.tensor(-4.5951))
+            # Multi-scale zero-init adapter heads.
+            # Step 1 output is exactly zero to preserve the discrete 3.0 baseline.
+            self.wave_residual_low_head = nn.Conv1d(1, 1, kernel_size=1)
+            self.wave_residual_high_head = nn.Conv1d(1, 1, kernel_size=1)
+            nn.init.zeros_(self.wave_residual_low_head.weight)
+            nn.init.zeros_(self.wave_residual_low_head.bias)
+            nn.init.zeros_(self.wave_residual_high_head.weight)
+            nn.init.zeros_(self.wave_residual_high_head.bias)
+            self.alphas = nn.Parameter(torch.zeros(2))
         
         self.val_metrics = kwargs.get("val_metrics")
         self.test_metrics = kwargs.get("test_metrics")
@@ -289,9 +301,27 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         wave_input = torch.cat([x_wave, base_wave, residual_hint], dim=1)
         wave_delta_raw = self.wave_residual_net(wave_input)
         wave_delta_raw = wave_delta_raw[..., :target_len]
-        # 使用可学习的 alpha 系数进行柔和融合
-        alpha = torch.sigmoid(self.wave_residual_alpha_scale)
-        wave_delta = alpha * wave_delta_raw
+
+        if (
+            self.wave_residual_multiscale
+            and self.wave_residual_low_head is not None
+            and self.wave_residual_high_head is not None
+            and self.alphas is not None
+        ):
+            # Injection A (low-frequency envelope): pooled coarse branch.
+            stride = max(2, int(self.wave_residual_low_stride))
+            low_feat = F.avg_pool1d(wave_delta_raw, kernel_size=stride, stride=stride, ceil_mode=True)
+            low_delta = self.wave_residual_low_head(low_feat)
+            low_delta = F.interpolate(low_delta, size=target_len, mode="linear", align_corners=False)
+
+            # Injection B (high-frequency details): full-resolution branch.
+            high_delta = self.wave_residual_high_head(wave_delta_raw)
+
+            alpha = torch.sigmoid(self.alphas).to(wave_delta_raw.dtype)
+            wave_delta = alpha[0] * low_delta + alpha[1] * high_delta
+        else:
+            wave_delta = wave_delta_raw
+
         fused_wave = base_wave + wave_delta
         return fused_wave, wave_delta
 
