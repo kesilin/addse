@@ -1,364 +1,332 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ADDSE 并联架构物理特性诊断脚本
+Parallel Physics Probe v2
 
-目标：解开"并联能否Work"的生死谜题
-通过三个关键实验判断冻结解码器是否支持隐空间加法。
+Covers:
+- Exp2 Oracle Blueprint Gap
+- Exp4 Sample-rate alignment / phase consistency hard injection
+- Exp5 Conditioning strength (with-hint vs no-hint)
+- Q1 Injection point move (Block2 -> Block0)
+- Q2 Alpha scan (0.01 -> 0.5)
+- Q3 Backbone token quality (200 vs 400 diffusion steps)
+
+Note:
+Exp1 and Exp3 are run from run_v33.py in terminal so you can observe training logs directly.
 """
 
+from __future__ import annotations
+
+import io
 import os
 import sys
-import io
-
-# 设置UTF-8编码
-if sys.stdout.encoding != 'utf-8':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-
-import numpy as np
-import torch
-import torchaudio
+from dataclasses import dataclass
 from pathlib import Path
 
-from addse.lightning import load_nac
-from addse.metrics import PESQMetric, STOIMetric, SDRMetric
-from hydra.utils import instantiate
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchaudio
 import yaml
+from hydra.utils import instantiate
+
+from addse.metrics import PESQMetric, SDRMetric, STOIMetric
+from addse.utils import load_hydra_config
+
+# Force UTF-8 in Windows terminal output.
+if sys.stdout.encoding != "utf-8":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+# Ensure relative paths in hydra configs (e.g., configs/nac.yaml) resolve correctly.
+PROJECT_ROOT = Path(__file__).resolve().parent
+os.chdir(PROJECT_ROOT)
+
+
+@dataclass
+class ProbeContext:
+    lm: torch.nn.Module
+    nac: torch.nn.Module
+    clean: torch.Tensor
+    noisy: torch.Tensor
+    sr: int
+    device: torch.device
+
+
+def _resolve_existing(paths: list[str]) -> str:
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"None of candidates exists: {paths}")
+
+
+def _load_lm(lm_cfg: str, lm_ckpt: str, device: torch.device):
+    cfg, _ = load_hydra_config(lm_cfg)
+    lm = instantiate(cfg.lm).to(device)
+    ckpt = torch.load(lm_ckpt, map_location="cpu")
+    lm.load_state_dict(ckpt["state_dict"], strict=False)
+    lm.eval()
+    return lm
+
+
+def _pad_to_codec(nac: torch.nn.Module, wav: torch.Tensor) -> torch.Tensor:
+    n_pad = (nac.downsampling_factor - wav.shape[-1] % nac.downsampling_factor) % nac.downsampling_factor
+    return F.pad(wav, (0, n_pad))
+
 
 @torch.no_grad()
-def run_physics_probe(
-    nac_cfg: str = "configs/nac.yaml",
-    nac_ckpt: str = "logs/addse-edbase-quick/checkpoints/addse-s.ckpt",
-    output_dir: str = "probe_outputs",
-    clean_wav: str = "saved_audio_v33/edbase-local_000000_clean.wav",
-) -> dict:
-    """执行隐空间并联物理特性探测。
-    
-    Args:
-        nac_cfg: NAC配置文件路径
-        nac_ckpt: NAC检查点路径（或ADDSE模型路径）
-        output_dir: 输出目录
-        
-    Returns:
-        诊断结果字典
-    """
-    print("=" * 80)
-    print("[START] 开始执行隐空间并联物理特性探测")
-    print("=" * 80)
-    
-    # 创建输出目录
-    Path(output_dir).mkdir(exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
-    
-    # ===== 1. 加载冻结的编解码器 =====
-    print("\n[1/5] 加载 NAC Codec...")
-    try:
-        # 尝试先加载ADDSE完整模型，从中提取NAC
-        model_path = "logs/addse-s-edbase-parallel60-a008-p02-spec/checkpoints/last.ckpt"
-        if os.path.exists(model_path):
-            print(f"  从ADDSE模型 {model_path} 加载NAC...")
-            ckpt = torch.load(model_path, map_location=device)
-            
-            # 首先加载nac配置
-            with open(nac_cfg) as f:
-                cfg = yaml.safe_load(f)
-            nac = instantiate(cfg["lm"]["generator"])
-            nac = nac.to(device)
-            
-            # 从ADDSE checkpoint中提取NAC的state_dict
-            nac_state_dict = {}
-            for k, v in ckpt["state_dict"].items():
-                if k.startswith("nac."):
-                    # 移除 "nac." 前缀
-                    new_k = k[4:]
-                    nac_state_dict[new_k] = v
-            
-            if nac_state_dict:
-                nac.load_state_dict(nac_state_dict, strict=False)
-                print(f"[OK] 从ADDSE模型提取NAC成功 (加载 {len(nac_state_dict)} 个参数)")
-            else:
-                print("  未找到NAC参数，尝试直接加载NAC检查点...")
-                nac, mask_token = load_nac(nac_cfg, nac_ckpt)
-        else:
-            nac, mask_token = load_nac(nac_cfg, nac_ckpt)
-        
-        nac = nac.to(device)
-        nac.eval()
-        for param in nac.parameters():
-            param.requires_grad = False
-        print(f"[OK] NAC 加载成功")
-        print(f"  - Downsampling Factor: {nac.downsampling_factor}")
-    except Exception as e:
-        print(f"[FAIL] NAC 加载失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
-    
-    # ===== 2. 准备可复现的干净语音样本 =====
-    print("\n[2/5] 准备测试音频...")
-    test_samples = []
+def _predict_tokens_and_residual(lm: torch.nn.Module, noisy_wav: torch.Tensor, num_steps: int):
+    nac = lm.nac
+    x_pad = _pad_to_codec(nac, noisy_wav)
+    x_lat = nac.encoder(x_pad)
+    x_tok, x_q = nac.encode(x_pad, no_sum=True, domain="q")
 
-    if os.path.exists(clean_wav):
-        wav, sr = torchaudio.load(clean_wav)
-        test_samples.append({"wav": wav, "sr": sr, "path": clean_wav})
-        print(f"[OK] 使用指定 clean 样本: {clean_wav} (sr={sr}, len={wav.shape[-1]})")
-    else:
-        print(f"  指定样本不存在，回退到自动搜索: {clean_wav}")
-        for wav_file in Path("saved_audio_v33").rglob("*_clean.wav"):
-            wav, sr = torchaudio.load(str(wav_file))
-            test_samples.append({"wav": wav, "sr": sr, "path": str(wav_file)})
-            print(f"[OK] 自动选择 clean 样本: {wav_file.name} (sr={sr}, len={wav.shape[-1]})")
+    B, K, L = x_tok.shape
+    y_tok = torch.full_like(x_tok, lm.mask_token)
+
+    final_residual = None
+    final_conf = None
+
+    import math
+
+    for i in range(num_steps):
+        mask = y_tok == lm.mask_token
+        if not mask.any():
             break
 
-    if len(test_samples) == 0:
-        print("  未找到 clean 语音，生成合成数据...")
-        sr = 16000
-        duration = 2.0
-        t = np.linspace(0, duration, int(sr * duration), endpoint=False)
-        
-        # 干净信号: 440 Hz + 880 Hz
-        clean = np.sin(2 * np.pi * 440 * t) + 0.5 * np.sin(2 * np.pi * 880 * t)
-        clean = clean / (np.max(np.abs(clean)) + 1e-8)  # 归一化
-        
-        test_samples.append({
-            'wav': torch.from_numpy(clean).float().unsqueeze(0),
-            'sr': sr,
-            'path': '<synthetic>'
-        })
-        print(f"[OK] 生成合成音频 (sr={sr}, duration={duration}s)")
-    
-    test_wav = test_samples[0]['wav'].to(device)
-    sr = test_samples[0]['sr']
+        y_q_step = nac.quantizer.decode(y_tok.masked_fill(mask, 0), output_no_sum=True, domain="code")
+        if y_q_step.shape != x_q.shape and y_q_step.ndim == 4:
+            if y_q_step.shape[2] == x_q.shape[1]:
+                y_q_step = y_q_step.transpose(1, 2)
+            elif y_q_step.shape[1] != x_q.shape[1]:
+                y_q_step = y_q_step.reshape(x_q.shape)
+        y_q_step = y_q_step.masked_fill(mask.unsqueeze(1), 0)
 
-    # 强制形状为 (B, C, T)
-    if test_wav.ndim == 1:
-        test_wav = test_wav.unsqueeze(0).unsqueeze(0)
-    elif test_wav.ndim == 2:
-        test_wav = test_wav.unsqueeze(0)
-    if test_wav.shape[1] > 1:
-        test_wav = test_wav[:, :1, :]
-    print(f"[OK] 输入波形形状: {tuple(test_wav.shape)}")
-    
-    # 初始化指标计算器
+        log_p, residual_pred, _ = lm.log_score(y_q_step, x_q, x_cont=x_lat)
+        if residual_pred is not None:
+            if final_residual is None:
+                final_residual = residual_pred
+            else:
+                decay = min(max(lm.residual_ema_decay, 0.0), 0.99)
+                final_residual = decay * final_residual + (1.0 - decay) * residual_pred
+
+        probs = log_p.exp()
+        final_conf = probs.max(dim=-1).values.mean(dim=(1, 2), keepdim=True)
+        sampled = probs.argmax(dim=-1)[mask]
+        y_tok_new = y_tok.clone()
+        y_tok_new[mask] = sampled
+
+        if i == num_steps - 1:
+            y_tok = y_tok_new
+            break
+
+        confidence = probs[mask].gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+        conf_full = torch.full_like(y_tok, 1e9, dtype=torch.float32)
+        conf_full[mask] = confidence
+
+        ratio = math.cos(math.pi / 2 * (i + 1) / num_steps)
+        num_mask = int(ratio * K * L)
+        if num_mask > 0:
+            conf_flat = conf_full.view(B, -1)
+            cutoff_vals, _ = torch.topk(conf_flat, num_mask, dim=-1, largest=False)
+            cutoff = cutoff_vals[:, -1:]
+            new_mask = (conf_flat <= cutoff).view(B, K, L)
+            y_tok_new[new_mask] = lm.mask_token
+        y_tok = y_tok_new
+
+    y_q_discrete = nac.quantizer.decode(y_tok, output_no_sum=False, domain="code")
+    if y_q_discrete.ndim == 4:
+        y_q_discrete = y_q_discrete.sum(dim=1) if y_q_discrete.shape[1] == K else y_q_discrete.sum(dim=2)
+
+    return y_q_discrete, final_residual, final_conf
+
+
+class _SinglePointInjector:
+    def __init__(self, decoder: nn.Module, point: str, residual_signal: torch.Tensor, alpha: float) -> None:
+        self.decoder = decoder
+        self.point = point
+        self.residual_signal = residual_signal
+        self.alpha = alpha
+        self.hook = None
+
+    def __enter__(self):
+        parts = self.point.split(".")
+        mod = self.decoder
+        for p in parts:
+            mod = mod[int(p)] if p.isdigit() else getattr(mod, p)
+
+        def _hook(_m, _i, out):
+            res = self.residual_signal
+            if res.shape[-1] != out.shape[-1]:
+                res_i = F.interpolate(res, size=out.shape[-1], mode="linear", align_corners=False)
+            else:
+                res_i = res
+            if res_i.shape[1] != out.shape[1]:
+                # lightweight channel projection (no grad needed for probe)
+                w = torch.zeros((out.shape[1], res_i.shape[1], 1), device=out.device, dtype=out.dtype)
+                n = min(out.shape[1], res_i.shape[1])
+                w[:n, :n, 0] = 1.0
+                res_i = F.conv1d(res_i, w)
+            return out + self.alpha * res_i
+
+        self.hook = mod.register_forward_hook(_hook)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.hook is not None:
+            self.hook.remove()
+
+
+def _compute_metrics(pred: torch.Tensor, ref: torch.Tensor, sr: int) -> dict[str, float]:
     pesq_metric = PESQMetric(fs=sr)
-    stoi_metric = STOIMetric(fs=sr, extended=True)
-    sdr_metric = SDRMetric(scale_invariant=False, zero_mean=False)
+    estoi_metric = STOIMetric(fs=sr, extended=True)
     si_sdr_metric = SDRMetric(scale_invariant=True, zero_mean=True)
-    
-    # ===== 3. 编码并提取关键特征 =====
-    print("\n[3/5] 提取 Latent 特征与离散 Token...")
-    
-    # 填充到采样因子对齐
-    n_pad = (nac.downsampling_factor - test_wav.shape[-1]) % nac.downsampling_factor
-    test_wav_pad = torch.nn.functional.pad(test_wav, (0, n_pad))
-    
-    try:
-        # 获取干净的连续隐特征
-        z_clean_lat = nac.encoder(test_wav_pad)
-        print(f"✓ 干净隐特征: shape={z_clean_lat.shape}, dtype={z_clean_lat.dtype}")
-        
-        # 获取量化后的离散特征 (带 no_sum=True 保留多codebook)
-        _, z_clean_q = nac.encode(test_wav_pad, no_sum=True, domain="q")
-        print(f"✓ 离散量化特征: shape={z_clean_q.shape}")
-        
-        # 计算离散求和特征：z_clean_q 形状为 (B, C, K, L)，应在 codebook 维 K 上求和。
-        z_clean_q_sum = z_clean_q.sum(dim=2) if z_clean_q.ndim == 4 else z_clean_q
-        print(f"✓ 离散求和特征: shape={z_clean_q_sum.shape}")
-        
-    except Exception as e:
-        print(f"✗ 编码失败: {e}")
-        return {"error": f"编码失败: {e}"}
-    
-    results = {}
-    
-    # ===== 实验 A: 离散天花板 =====
-    print("\n[4/5] 执行三个关键实验...")
-    print("\n  [A] 离散天花板 (纯骨架, 无残差)")
-    try:
-        wav_discrete_only = nac.decode(z_clean_q_sum, domain="q")
-        wav_discrete_only = wav_discrete_only[..., :test_wav.shape[-1]]
-        
-        # 保存输出
-        output_path_a = os.path.join(output_dir, "probe_A_discrete_only.wav")
-        torchaudio.save(output_path_a, wav_discrete_only[0].cpu(), sr)
-        
-        # 计算指标 (指标实现期望输入为 (C, T))
-        pesq_a = pesq_metric(wav_discrete_only[0], test_wav[0])
-        estoi_a = stoi_metric(wav_discrete_only[0], test_wav[0])
-        sdr_a = sdr_metric(wav_discrete_only[0], test_wav[0])
-        si_sdr_a = si_sdr_metric(wav_discrete_only[0], test_wav[0])
-        
-        results['A'] = {
-            'pesq': pesq_a,
-            'estoi': estoi_a,
-            'sdr': sdr_a,
-            'si_sdr': si_sdr_a,
-            'path': output_path_a,
-            'description': '纯离散解码 (基线)'
-        }
-        
-        print(f"  ✓ PESQ={pesq_a:.3f}, ESTOI={estoi_a:.3f}, SDR={sdr_a:.3f}, SI-SDR={si_sdr_a:.3f}")
-        print(f"    💾 保存到: {output_path_a}")
-        
-    except Exception as e:
-        print(f"  ✗ 实验A失败: {e}")
-        results['A'] = {'error': str(e)}
-    
-    # ===== 实验 B: 神之残差 =====
-    print("\n  [B] 神之残差 (离散 + 完美真实残差)")
-    try:
-        # 计算物理上丢失的真实残差
-        oracle_residual = z_clean_lat - z_clean_q_sum
-        print(f"    Oracle残差幅度: mean={oracle_residual.abs().mean():.6f}, max={oracle_residual.abs().max():.6f}")
-        
-        # 物理相加
-        z_oracle_fused = z_clean_q_sum + oracle_residual
-        
-        wav_oracle_fused = nac.decode(z_oracle_fused, domain="q")
-        wav_oracle_fused = wav_oracle_fused[..., :test_wav.shape[-1]]
-        
-        output_path_b = os.path.join(output_dir, "probe_B_oracle_fused.wav")
-        torchaudio.save(output_path_b, wav_oracle_fused[0].cpu(), sr)
-        
-        # 计算指标 (指标实现期望输入为 (C, T))
-        pesq_b = pesq_metric(wav_oracle_fused[0], test_wav[0])
-        estoi_b = stoi_metric(wav_oracle_fused[0], test_wav[0])
-        sdr_b = sdr_metric(wav_oracle_fused[0], test_wav[0])
-        si_sdr_b = si_sdr_metric(wav_oracle_fused[0], test_wav[0])
-        
-        results['B'] = {
-            'pesq': pesq_b,
-            'estoi': estoi_b,
-            'sdr': sdr_b,
-            'si_sdr': si_sdr_b,
-            'path': output_path_b,
-            'description': '离散 + 真实残差 (神之上限)'
-        }
-        
-        print(f"  ✓ PESQ={pesq_b:.3f}, ESTOI={estoi_b:.3f}, SDR={sdr_b:.3f}, SI-SDR={si_sdr_b:.3f}")
-        print(f"    💾 保存到: {output_path_b}")
-        
-    except Exception as e:
-        print(f"  ✗ 实验B失败: {e}")
-        results['B'] = {'error': str(e)}
-    
-    # ===== 实验 C: 随机噪声破坏程度 =====
-    print("\n  [C] 随机噪声破坏 (模拟未训练网络)")
-    try:
-        # 生成与oracle_residual同尺度的随机噪声
-        scale = oracle_residual.std().item()
-        random_residual = torch.randn_like(oracle_residual) * scale * 0.5
-        
-        z_random_fused = z_clean_q_sum + random_residual
-        
-        wav_random_fused = nac.decode(z_random_fused, domain="q")
-        wav_random_fused = wav_random_fused[..., :test_wav.shape[-1]]
-        
-        output_path_c = os.path.join(output_dir, "probe_C_random_fused.wav")
-        torchaudio.save(output_path_c, wav_random_fused[0].cpu(), sr)
-        
-        # 计算指标 (指标实现期望输入为 (C, T))
-        pesq_c = pesq_metric(wav_random_fused[0], test_wav[0])
-        estoi_c = stoi_metric(wav_random_fused[0], test_wav[0])
-        sdr_c = sdr_metric(wav_random_fused[0], test_wav[0])
-        si_sdr_c = si_sdr_metric(wav_random_fused[0], test_wav[0])
-        
-        results['C'] = {
-            'pesq': pesq_c,
-            'estoi': estoi_c,
-            'sdr': sdr_c,
-            'si_sdr': si_sdr_c,
-            'path': output_path_c,
-            'description': '离散 + 随机高斯残差 (噪声破坏)'
-        }
-        
-        print(f"  ✓ PESQ={pesq_c:.3f}, ESTOI={estoi_c:.3f}, SDR={sdr_c:.3f}, SI-SDR={si_sdr_c:.3f}")
-        print(f"    💾 保存到: {output_path_c}")
-        
-    except Exception as e:
-        print(f"  ✗ 实验C失败: {e}")
-        results['C'] = {'error': str(e)}
-    
-    # ===== 5. 诊断分析 =====
-    print("\n[5/5] 诊断分析")
-    print("=" * 80)
-    
-    if 'A' in results and 'error' not in results['A'] and \
-       'B' in results and 'error' not in results['B'] and \
-       'C' in results and 'error' not in results['C']:
-        
-        pesq_a = results['A']['pesq']
-        pesq_b = results['B']['pesq']
-        pesq_c = results['C']['pesq']
-        
-        si_sdr_a = results['A']['si_sdr']
-        si_sdr_b = results['B']['si_sdr']
-        si_sdr_c = results['C']['si_sdr']
-        
-        print(f"\n[METRICS] 结果对比:")
-        print(f"  (+) A (纯离散):      PESQ={pesq_a:.3f}, SI-SDR={si_sdr_a:+.2f}")
-        print(f"  (✓) B (神之残差):    PESQ={pesq_b:.3f}, SI-SDR={si_sdr_b:+.2f}  Δ={pesq_b-pesq_a:+.3f}")
-        print(f"  (-) C (随机噪声):    PESQ={pesq_c:.3f}, SI-SDR={si_sdr_c:+.2f}  Δ={pesq_c-pesq_a:+.3f}")
-        
-        print(f"\n[DIAG] 关键诊断:")
-        
-        # 判断 B 是否接近完美
-        if pesq_b < 3.5:
-            print(f"\n  [CRITICAL] 神之残差依然效果差 (PESQ={pesq_b:.3f} < 3.5)")
-            print(f"     这说明冻结解码器拒绝隐空间加法操作！")
-            print(f"     [FAIL] 当前的纯隐空间并联架构不可行！")
-            print(f"\n     建议方案:")
-            print(f"     1. 尝试解冻解码器的最后几层并动态微调")
-            print(f"     2. 转向波形级别的后处理 (Post-Net + Concat)")
-            print(f"     3. 考虑使用其他特征空间 (e.g., STFTLoss)")
-            results['diagnosis'] = 'FAILED_ARCHITECTURE_INCOMPATIBLE'
-        else:
-            print(f"\n  [PASS] 架构可行：神之残差效果极好 (PESQ={pesq_b:.3f})")
-            print(f"     隐空间加法物理上是可行的！")
-            print(f"     [INFO] 问题出在连续分支训练不足上！")
-            print(f"\n     建议方案:")
-            print(f"     1. 增加训练轮次 (当前只有5个epoch)")
-            print(f"     2. 调整residual_l1_loss权重和学习对象")
-            print(f"     3. 改进损失函数 (考虑SI-SDR而非L1)")
-            results['diagnosis'] = 'PASSED_ARCHITECTURE_VIABLE'
-        
-        # C与A的差异表示噪声的破坏程度
-        noise_impact = pesq_a - pesq_c
-        print(f"\n  [NOISE] 噪声破坏程度: {noise_impact:.3f} PESQ点")
-        if noise_impact > 0.5:
-            print(f"     隐空间对噪声很敏感 (需要精准控制梯度)")
-        
-        results['noise_impact'] = noise_impact
-    
-    # ===== 保存完整结果 =====
-    print(f"\n[DONE] 诊断完成！")
-    print(f"输出文件位置: {os.path.abspath(output_dir)}")
-    print("=" * 80)
-    
+    sdr_metric = SDRMetric(scale_invariant=False, zero_mean=False)
+    return {
+        "pesq": float(pesq_metric(pred[0], ref[0])),
+        "estoi": float(estoi_metric(pred[0], ref[0])),
+        "si_sdr": float(si_sdr_metric(pred[0], ref[0])),
+        "sdr": float(sdr_metric(pred[0], ref[0])),
+    }
+
+
+@torch.no_grad()
+def build_context() -> ProbeContext:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    root = Path(__file__).resolve().parent
+
+    lm_cfg = _resolve_existing([str(root / "configs" / "addse-s-edbase-parallel60-a008-p02-spec.yaml")])
+    lm_ckpt = _resolve_existing([
+        str(root / "logs" / "addse-s-edbase-parallel60-a008-p02-spec" / "checkpoints" / "last.ckpt"),
+        str(root / "logs" / "addse-s-edbase-parallel60-a008-p02-spec" / "checkpoints" / "epoch=01-val_loss=6.01.ckpt"),
+    ])
+
+    clean_wav = _resolve_existing([str(root / "saved_audio_v33" / "edbase-local_000000_clean.wav")])
+    clean, sr = torchaudio.load(clean_wav)
+    clean = clean[:1].unsqueeze(0).to(device)
+
+    # Create controlled noisy input for DiT token prediction tests.
+    noise = torch.randn_like(clean)
+    snr_db = 5.0
+    clean_rms = clean.pow(2).mean().sqrt().clamp_min(1e-8)
+    noise_rms = noise.pow(2).mean().sqrt().clamp_min(1e-8)
+    scale = clean_rms / (10 ** (snr_db / 20.0) * noise_rms)
+    noisy = (clean + scale * noise).clamp(-1.0, 1.0)
+
+    lm = _load_lm(lm_cfg, lm_ckpt, device)
+
+    print("=" * 88)
+    print("[Probe] Loaded LM context")
+    print(f"  device={device} | sr={sr} | lm_ckpt={lm_ckpt}")
+    print("=" * 88)
+    return ProbeContext(lm=lm, nac=lm.nac, clean=clean, noisy=noisy, sr=sr, device=device)
+
+
+@torch.no_grad()
+def run_probe() -> dict:
+    ctx = build_context()
+    out_dir = Path(__file__).resolve().parent / "probe_outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    clean_pad = _pad_to_codec(ctx.nac, ctx.clean)
+    noisy_pad = _pad_to_codec(ctx.nac, ctx.noisy)
+
+    z_clean_lat = ctx.nac.encoder(clean_pad)
+    _, z_clean_q = ctx.nac.encode(clean_pad, no_sum=True, domain="q")
+    z_clean_q_sum = z_clean_q.sum(dim=2) if z_clean_q.ndim == 4 else z_clean_q
+    oracle_res = z_clean_lat - z_clean_q_sum
+
+    results: dict[str, dict] = {}
+
+    # Q3 + Exp2: token blueprint quality and oracle blueprint gap.
+    print("\n[Exp2/Q3] Oracle Blueprint Gap + 200 vs 400 steps")
+    for steps in (200, 400):
+        y_q_pred, final_res, _ = _predict_tokens_and_residual(ctx.lm, ctx.noisy, num_steps=steps)
+        wav_backbone = ctx.lm._decode_latent_to_wave(y_q_pred, target_length=ctx.clean.shape[-1])
+        wav_oracle_gap = ctx.lm._decode_latent_to_wave(y_q_pred + oracle_res, target_length=ctx.clean.shape[-1])
+        m_back = _compute_metrics(wav_backbone, ctx.clean, ctx.sr)
+        m_gap = _compute_metrics(wav_oracle_gap, ctx.clean, ctx.sr)
+
+        results[f"q3_backbone_{steps}"] = m_back
+        results[f"exp2_oracle_gap_{steps}"] = m_gap
+
+        torchaudio.save(str(out_dir / f"q3_backbone_{steps}.wav"), wav_backbone[0].cpu(), ctx.sr)
+        torchaudio.save(str(out_dir / f"exp2_oracle_gap_{steps}.wav"), wav_oracle_gap[0].cpu(), ctx.sr)
+
+        print(
+            f"  steps={steps} | backbone PESQ={m_back['pesq']:.3f} | oracle-gap PESQ={m_gap['pesq']:.3f} "
+            f"| delta={m_gap['pesq'] - m_back['pesq']:+.3f}"
+        )
+
+        if final_res is not None:
+            # Exp5: conditioning strength with/without hint.
+            base_wave = ctx.lm._decode_latent_to_wave(y_q_pred, target_length=ctx.clean.shape[-1])
+            wav_with_hint, _ = ctx.lm._predict_wave_residual(ctx.noisy, base_wave, final_res)
+            wav_no_hint, _ = ctx.lm._predict_wave_residual(ctx.noisy, base_wave, None)
+            m_with = _compute_metrics(wav_with_hint, ctx.clean, ctx.sr)
+            m_no = _compute_metrics(wav_no_hint, ctx.clean, ctx.sr)
+            results[f"exp5_with_hint_{steps}"] = m_with
+            results[f"exp5_no_hint_{steps}"] = m_no
+            print(
+                f"  exp5 steps={steps} | with-hint PESQ={m_with['pesq']:.3f} | "
+                f"no-hint PESQ={m_no['pesq']:.3f} | delta={m_no['pesq'] - m_with['pesq']:+.3f}"
+            )
+
+    # Exp4: phase consistency by hard injecting true waveform residual.
+    print("\n[Exp4] Sample-rate alignment hard-injection check")
+    y_q_pred_400, _, _ = _predict_tokens_and_residual(ctx.lm, ctx.noisy, num_steps=400)
+    y_base = ctx.lm._decode_latent_to_wave(y_q_pred_400, target_length=ctx.clean.shape[-1])
+    wav_true_res = (ctx.clean - y_base).detach()
+    y_hard = y_base + wav_true_res
+    m_hard = _compute_metrics(y_hard, ctx.clean, ctx.sr)
+    results["exp4_hard_residual"] = m_hard
+    print(
+        f"  hard-injection PESQ={m_hard['pesq']:.3f} | SI-SDR={m_hard['si_sdr']:.3f} "
+        f"(if still negative => likely alignment bug)"
+    )
+
+    # Q1 + Q2: injection-point move and alpha scan on decoder features.
+    print("\n[Q1/Q2] Injection point and alpha sweep")
+    decoder = ctx.nac.decoder if hasattr(ctx.nac, "decoder") else ctx.nac.generator
+
+    # Build residual signal in decoder feature domain proxy (from oracle residual mean channel).
+    proxy = oracle_res.mean(dim=1, keepdim=True)
+
+    z_discrete = z_clean_q_sum
+
+    # Q1: block2 vs block0 with fixed alpha=0.05
+    q1_rows = []
+    for point in ("blocks.2", "blocks.0"):
+        with _SinglePointInjector(decoder, point, proxy, alpha=0.05):
+            wav = ctx.nac.decode(z_discrete, domain="q")[..., : ctx.clean.shape[-1]]
+        m = _compute_metrics(wav, ctx.clean, ctx.sr)
+        results[f"q1_{point.replace('.', '_')}"] = m
+        q1_rows.append((point, m["pesq"], m["si_sdr"]))
+    for p, pesq, si in q1_rows:
+        print(f"  point={p} | PESQ={pesq:.3f} | SI-SDR={si:.3f}")
+
+    # Q2: alpha scan on one stable point
+    alpha_rows = []
+    for alpha in (0.01, 0.05, 0.1, 0.2, 0.5):
+        with _SinglePointInjector(decoder, "blocks.2", proxy, alpha=alpha):
+            wav = ctx.nac.decode(z_discrete, domain="q")[..., : ctx.clean.shape[-1]]
+        m = _compute_metrics(wav, ctx.clean, ctx.sr)
+        results[f"q2_alpha_{alpha}"] = m
+        alpha_rows.append((alpha, m["pesq"], m["si_sdr"]))
+    for a, pesq, si in alpha_rows:
+        print(f"  alpha={a:.2f} | PESQ={pesq:.3f} | SI-SDR={si:.3f}")
+
+    print("\n[Summary] Key outputs")
+    print("  - q3_backbone_200.wav / q3_backbone_400.wav")
+    print("  - exp2_oracle_gap_200.wav / exp2_oracle_gap_400.wav")
+    print("  - Metrics dict emitted below")
+
     return results
 
 
 if __name__ == "__main__":
-    results = run_physics_probe()
-    
-    # 打印诊断结果摘要
-    print("\n" + "=" * 80)
-    print("[SUMMARY] 诊断结果摘要")
-    print("=" * 80)
-    if 'diagnosis' in results:
-        print(f"\n最终诊断: {results['diagnosis']}")
-        if results['diagnosis'] == 'PASSED_ARCHITECTURE_VIABLE':
-            print("\n[PASS] 并联架构本身是可行的！现在需要:")
-            print("  1. 更长的训练周期")
-            print("  2. 更好的损失函数设计")
-            print("  3. 校正学习率和权重配置")
-        else:
-            print("\n[FAIL] 并联架构存在根本性问题，需要重新设计")
-    
-    print("\n实验结果:")
-    for exp in ['A', 'B', 'C']:
-        if exp in results and 'error' not in results[exp]:
-            r = results[exp]
-            print(f"\n{exp}. {r['description']}")
-            print(f"   PESQ={r['pesq']:.3f}, ESTOI={r['estoi']:.3f}, SDR={r['sdr']:.3f}, SI-SDR={r['si_sdr']:+.2f}")
+    out = run_probe()
+    print("\n" + "=" * 88)
+    print("FINAL METRICS")
+    print("=" * 88)
+    for k, v in out.items():
+        print(f"{k}: {v}")

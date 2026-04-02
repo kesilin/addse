@@ -27,6 +27,12 @@ if __name__ == "__main__":
     parser.add_argument("--deterministic-eval", action="store_true", help="Use deterministic token decoding during eval")
     parser.add_argument("--output-db", type=str, default="v33_decoupled.db")
     parser.add_argument("--output-dir", type=str, default="saved_audio_v33")
+    parser.add_argument("--disable-wave-residual", action="store_true", help="Disable wave residual side-stream branch")
+    parser.add_argument("--direct-residual-weight", type=float, default=1.0, help="Weight for explicit DEX residual supervision")
+    parser.add_argument("--residual-l1-weight", type=float, default=0.0, help="Fallback latent residual L1 weight")
+    parser.add_argument("--si-sdr-weight", type=float, default=0.2, help="Wave-domain SI-SDR weight for this run")
+    parser.add_argument("--alpha-init-prob", type=float, default=0.05, help="Initial sigmoid probability for alpha gates")
+    parser.add_argument("--print-alpha", action="store_true", help="Print alpha logs in progress bar (handled in lightning logs)")
     args = parser.parse_args()
 
     # ====================================================================
@@ -60,11 +66,17 @@ if __name__ == "__main__":
             # ==== 1.1 P-SSA 训练超参（从 Oracle 过渡到真实训练） ====
             "++lm.spec_loss_weight=1.0",
             "++lm.wave_l1_weight=2.0",
-            "++lm.si_sdr_weight=0.5",
+            f"++lm.si_sdr_weight={args.si_sdr_weight}",
+            f"++lm.residual_l1_weight={args.residual_l1_weight}",
+            f"++lm.direct_residual_weight={args.direct_residual_weight}",
             "++lm.metricgan_plus_enabled=false",
             "++lm.metricgan_weight=0.0",
             "++lm.wave_residual_multiscale=true",
             "++lm.wave_residual_low_stride=8",
+            f"++lm.alpha_init_prob={args.alpha_init_prob}",
+
+            # ==== 1.2 实验开关 ====
+            f"++lm.wave_residual_enabled={str((not args.disable_wave_residual)).lower()}",
 
             # ==== 2. 硬件加速（榨干性能，帮你省时间） ====
             "++dm.train_dataloader.num_workers=8",   # 开启多线程读数据，别让 GPU 等 CPU
@@ -89,6 +101,7 @@ if __name__ == "__main__":
             checkpoint=best_ckpt,
             overrides=[
                 f"lm.num_steps={args.eval_steps}",
+                f"lm.wave_residual_enabled={str((not args.disable_wave_residual)).lower()}",
                 f"eval.dsets.edbase-local.length={args.eval_examples}",
                 f"lm.deterministic_eval={str(args.deterministic_eval).lower()}",
             ],

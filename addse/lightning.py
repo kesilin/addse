@@ -142,6 +142,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.spec_loss_weight = float(kwargs.get("spec_loss_weight", 0.0))
         self.si_sdr_weight = float(kwargs.get("si_sdr_weight", 0.0))
         self.residual_l1_weight = float(kwargs.get("residual_l1_weight", 2.0))
+        self.direct_residual_weight = float(kwargs.get("direct_residual_weight", 0.0))
         self.wave_l1_weight = float(kwargs.get("wave_l1_weight", 1.0))
         self.residual_cos_weight = float(kwargs.get("residual_cos_weight", 0.0))
         self.residual_std_weight = float(kwargs.get("residual_std_weight", 0.0))
@@ -208,7 +209,10 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             nn.init.zeros_(self.wave_residual_low_head.bias)
             nn.init.zeros_(self.wave_residual_high_head.weight)
             nn.init.zeros_(self.wave_residual_high_head.bias)
-            self.alphas = nn.Parameter(torch.zeros(2))
+            alpha_init_prob = float(kwargs.get("alpha_init_prob", 0.05))
+            alpha_init_prob = min(max(alpha_init_prob, 1e-4), 1.0 - 1e-4)
+            alpha_init_logit = math.log(alpha_init_prob / (1.0 - alpha_init_prob))
+            self.alphas = nn.Parameter(torch.full((2,), alpha_init_logit, dtype=torch.float32))
         
         self.val_metrics = kwargs.get("val_metrics")
         self.test_metrics = kwargs.get("test_metrics")
@@ -424,6 +428,12 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             y_pred = y_pred[..., :min_len]
             y_loss_target = y[..., :min_len]
             wave_residual_target = (y_loss_target - base_wave).detach()
+            true_residual = (y_lat_clean - y_q_sum).detach()
+
+            if residual_pred is not None and self.direct_residual_weight > 0:
+                direct_res_loss = F.l1_loss(residual_pred, true_residual)
+                total_loss = total_loss + self.direct_residual_weight * direct_res_loss
+                self.log(f"{stage}/direct_res_loss", direct_res_loss, prog_bar=True, sync_dist=True)
 
             if wave_delta is not None:
                 wave_delta = wave_delta[..., :min_len]
@@ -471,6 +481,11 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 total_loss = total_loss + self.wave_l1_weight * wave_l1
                 self.log(f"{stage}/wave_l1", wave_l1, prog_bar=False, sync_dist=True)
 
+            if self.alphas is not None:
+                alpha_vals = torch.sigmoid(self.alphas)
+                self.log(f"{stage}/alpha_low", alpha_vals[0], prog_bar=(stage == "train"), sync_dist=True)
+                self.log(f"{stage}/alpha_high", alpha_vals[1], prog_bar=(stage == "train"), sync_dist=True)
+
             if self.si_sdr_weight > 0:
                 si_sdr_loss = self._si_sdr_loss(y_pred, y_loss_target)
                 total_loss = total_loss + self.si_sdr_weight * si_sdr_loss
@@ -517,9 +532,14 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             # 旧的 latent 残差路径保留作 fallback。
             true_residual = (y_lat_clean - y_q_sum).detach()
 
-            res_loss = F.l1_loss(residual_pred, true_residual)
-            total_loss = total_loss + self.residual_l1_weight * res_loss
-            self.log(f"{stage}/res_loss", res_loss, prog_bar=True, sync_dist=True)
+            if self.direct_residual_weight > 0:
+                res_loss = F.l1_loss(residual_pred, true_residual)
+                total_loss = total_loss + self.direct_residual_weight * res_loss
+                self.log(f"{stage}/direct_res_loss", res_loss, prog_bar=True, sync_dist=True)
+            elif self.residual_l1_weight > 0:
+                res_loss = F.l1_loss(residual_pred, true_residual)
+                total_loss = total_loss + self.residual_l1_weight * res_loss
+                self.log(f"{stage}/res_loss", res_loss, prog_bar=True, sync_dist=True)
 
             if self.residual_cos_weight > 0:
                 res_cos = 1.0 - F.cosine_similarity(
