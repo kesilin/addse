@@ -16,9 +16,9 @@ from addse.app.eval import eval as eval_func
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("run_v33 short/full pipeline")
     parser.add_argument("--train-epochs", type=int, default=10)
-    parser.add_argument("--train-batches", type=int, default=20)
+    parser.add_argument("--train-batches", type=int, default=5)
     parser.add_argument("--eval-examples", type=int, default=60)
-    parser.add_argument("--eval-steps", type=int, default=128, help="Diffusion steps during eval; use 128 for performance-caliber evaluation")
+    parser.add_argument("--eval-steps", type=int, default=200, help="Diffusion steps during eval; use 200 for strict evaluation")
     parser.add_argument("--val-every", type=int, default=1)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--reset-log-dir", action="store_true", help="Delete log dir before training")

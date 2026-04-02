@@ -55,8 +55,9 @@ class ADDSERQDiT(nn.Module):
         return x_out.squeeze(2) if squeeze_output else x_out
 
 class ADDSERQDiTParallel(ADDSERQDiT):
-    """V3.5 QRC (Quantization Residual Compensation) 顶会级架构
-    采用 WaveNet 风格的空洞卷积，指数级扩大感受野，精准修复离散量化导致的高频与相位丢失。
+    """V3.5 QRC (Quantization Residual Compensation) 顶会级架构。
+
+    当前版本把连续支路当作 wave-domain late fusion 的连续 hint，而不是直接做 latent residual add。
     """
     def __init__(self, **kwargs) -> None:
         # 过滤 kwargs 传递给父类
@@ -132,7 +133,7 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             nn.Conv1d(quality_hidden, 1, kernel_size=1),
         )
 
-        # 将连续残差先投影到离散 logits 语义空间，避免“不同语义空间直接相加”导致交互失真。
+        # 将连续支路压成语义 hint，供下游的波形残差 late fusion 使用。
         self.interaction_proj = nn.Conv1d(in_channels, self.output_channels, kernel_size=1)
 
         if self.fusion_mode == "film":
@@ -141,6 +142,16 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             self.parallel_proj = None
         
         self._reset_parallel_parameters()
+
+    @staticmethod
+    def summarize_continuous_hint(residual_pred: Tensor) -> Tensor:
+        if residual_pred.ndim == 4:
+            residual_pred = residual_pred.mean(dim=1)
+        if residual_pred.ndim == 3:
+            return residual_pred.mean(dim=1, keepdim=True)
+        if residual_pred.ndim == 2:
+            return residual_pred.unsqueeze(1)
+        return residual_pred
 
     def _reset_parallel_parameters(self) -> None:
         with torch.no_grad():

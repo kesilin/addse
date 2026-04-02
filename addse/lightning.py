@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader, Dataset
 from .data import AudioStreamingDataLoader, DynamicMixingDataset
 from .losses import BaseLoss
 from .metrics import BaseMetric
-from .models import ADM, NAC, ADDSERQDiT, SGMSEUNet
+from .models import ADM, NAC, ADDSERQDiT, ConvTasNet, SGMSEUNet
 from .stft import STFT
 
 try:
@@ -48,8 +48,12 @@ class MetricDiscriminator(nn.Module):
         self.head = nn.Linear(hidden * 2, 1)
 
     def forward(self, y_hat: Tensor, y_ref: Tensor) -> Tensor:
-        x = torch.cat([y_hat, y_ref], dim=1)
-        h = self.net(x).squeeze(-1)
+        if y_hat.ndim == 2:
+            y_hat = y_hat.unsqueeze(1)
+        if y_ref.ndim == 2:
+            y_ref = y_ref.unsqueeze(1)
+        h = torch.cat([y_hat, y_ref], dim=1)
+        h = self.net(h).squeeze(-1)
         return torch.sigmoid(self.head(h))
 
 @dataclass
@@ -137,11 +141,15 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.spec_loss: BaseLoss | None = kwargs.get("spec_loss")
         self.spec_loss_weight = float(kwargs.get("spec_loss_weight", 0.0))
         self.si_sdr_weight = float(kwargs.get("si_sdr_weight", 0.0))
+        self.residual_l1_weight = float(kwargs.get("residual_l1_weight", 2.0))
+        self.wave_l1_weight = float(kwargs.get("wave_l1_weight", 1.0))
         self.residual_cos_weight = float(kwargs.get("residual_cos_weight", 0.0))
         self.residual_std_weight = float(kwargs.get("residual_std_weight", 0.0))
         self.residual_ema_decay = float(kwargs.get("residual_ema_decay", 0.8))
         self.quality_branch_weight = float(kwargs.get("quality_branch_weight", 0.0))
         self.quality_smooth_weight = float(kwargs.get("quality_smooth_weight", 0.0))
+        self.enable_latent_residual_add = bool(kwargs.get("enable_latent_residual_add", False))
+        self.max_residual_ratio = float(kwargs.get("max_residual_ratio", 0.05))
         self.fidelity_gate_enabled = bool(kwargs.get("fidelity_gate_enabled", True))
         self.fidelity_gate_min = float(kwargs.get("fidelity_gate_min", 0.15))
         self.fidelity_gate_max = float(kwargs.get("fidelity_gate_max", 1.0))
@@ -158,6 +166,37 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.metricgan_update_every = int(kwargs.get("metricgan_update_every", 8))
         self.metricgan_start_step = int(kwargs.get("metricgan_start_step", 100))
         self.metricgan_batch_items = int(kwargs.get("metricgan_batch_items", 1))
+        self.wave_residual_enabled = bool(kwargs.get("wave_residual_enabled", False))
+        self.wave_residual_num_filters = int(kwargs.get("wave_residual_num_filters", 256))
+        self.wave_residual_filter_size = int(kwargs.get("wave_residual_filter_size", 16))
+        self.wave_residual_hop_size = int(kwargs.get("wave_residual_hop_size", self.wave_residual_filter_size // 2))
+        self.wave_residual_bottleneck_channels = int(kwargs.get("wave_residual_bottleneck_channels", 64))
+        self.wave_residual_hidden_channels = int(kwargs.get("wave_residual_hidden_channels", 256))
+        self.wave_residual_skip_channels = int(kwargs.get("wave_residual_skip_channels", 64))
+        self.wave_residual_kernel_size = int(kwargs.get("wave_residual_kernel_size", 3))
+        self.wave_residual_layers = int(kwargs.get("wave_residual_layers", 4))
+        self.wave_residual_repeats = int(kwargs.get("wave_residual_repeats", 2))
+        self.wave_residual_causal = bool(kwargs.get("wave_residual_causal", False))
+        self.wave_residual_net: nn.Module | None = None
+        if self.wave_residual_enabled:
+            wave_norm = functools.partial(nn.BatchNorm1d, momentum=0.1)
+            self.wave_residual_net = ConvTasNet(
+                input_channels=3,
+                output_channels=1,
+                num_filters=self.wave_residual_num_filters,
+                filter_size=self.wave_residual_filter_size,
+                hop_size=self.wave_residual_hop_size,
+                bottleneck_channels=self.wave_residual_bottleneck_channels,
+                hidden_channels=self.wave_residual_hidden_channels,
+                skip_channels=self.wave_residual_skip_channels,
+                kernel_size=self.wave_residual_kernel_size,
+                layers=self.wave_residual_layers,
+                repeats=self.wave_residual_repeats,
+                causal=self.wave_residual_causal,
+                norm=wave_norm,
+            )
+            # 可学习的融合系数：logit(0.01) 使 sigmoid(alpha) 初始约为 0.01
+            self.wave_residual_alpha_scale = nn.Parameter(torch.tensor(-4.5951))
         
         self.val_metrics = kwargs.get("val_metrics")
         self.test_metrics = kwargs.get("test_metrics")
@@ -174,7 +213,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         trainable_param_patterns = kwargs.get("trainable_param_patterns")
         if trainable_param_patterns:
             self._apply_trainable_param_patterns(trainable_param_patterns)
-        
+
         pretrained_ckpt = kwargs.get("pretrained_ckpt")
         if pretrained_ckpt:
             if not os.path.exists(pretrained_ckpt):
@@ -184,6 +223,77 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             state_dict = ckpt_data.get("state_dict", ckpt_data)
             missing, unexpected = self.load_state_dict(state_dict, strict=False)
             print(f"--- 预加载完成 (missing={len(missing)}, unexpected={len(unexpected)}) ---")
+
+    @staticmethod
+    def _limit_residual_energy(base_lat: Tensor, residual: Tensor, max_ratio: float, eps: float = 1e-8) -> tuple[Tensor, Tensor]:
+        """Clamp residual RMS relative to base latent RMS to avoid decoder phase collapse."""
+        base_rms = base_lat.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(eps)
+        res_rms = residual.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(eps)
+        ratio = res_rms / base_rms
+        scale = torch.clamp(max_ratio / ratio, max=1.0)
+        return residual * scale, ratio
+
+    @staticmethod
+    def _sum_quantized_latent(latent: Tensor, num_codebooks: int) -> Tensor:
+        if latent.ndim != 4:
+            return latent
+        if latent.shape[1] == num_codebooks:
+            return latent.sum(dim=1)
+        if latent.shape[2] == num_codebooks:
+            return latent.sum(dim=2)
+        return latent.sum(dim=1)
+
+    def _decode_latent_to_wave(self, latent: Tensor, target_length: int | None = None) -> Tensor:
+        if hasattr(self.nac, "generator"):
+            wave = self.nac.generator(latent)
+        else:
+            wave = self.nac.decode(latent, no_sum=False, domain="q")
+        if target_length is not None:
+            wave = wave[..., :target_length]
+        return wave
+
+    def _predict_wave_residual(
+        self,
+        x_wave: Tensor,
+        base_wave: Tensor,
+        residual_hint: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor | None]:
+        if not self.wave_residual_enabled or self.wave_residual_net is None:
+            return base_wave, None
+
+        base_wave = base_wave.detach()
+        x_wave = x_wave.detach()
+        target_len = base_wave.shape[-1]
+        
+        if residual_hint is None:
+            residual_hint = torch.zeros((base_wave.shape[0], 1, target_len), 
+                                       dtype=base_wave.dtype, device=base_wave.device).detach()
+        else:
+            if hasattr(self.model, "summarize_continuous_hint"):
+                residual_hint = self.model.summarize_continuous_hint(residual_hint)
+            elif residual_hint.ndim == 3:
+                residual_hint = residual_hint.mean(dim=1, keepdim=True)
+            elif residual_hint.ndim == 4:
+                residual_hint = residual_hint.mean(dim=1)
+                if residual_hint.ndim == 3 and residual_hint.shape[1] != 1:
+                    residual_hint = residual_hint.mean(dim=1, keepdim=True)
+            residual_hint = residual_hint.detach()
+            
+            if residual_hint.shape[-1] != target_len:
+                residual_hint = F.interpolate(
+                    residual_hint, size=target_len, mode='nearest'
+                )
+
+        x_wave = x_wave[..., :target_len]
+        residual_hint = residual_hint[..., :target_len]
+        wave_input = torch.cat([x_wave, base_wave, residual_hint], dim=1)
+        wave_delta_raw = self.wave_residual_net(wave_input)
+        wave_delta_raw = wave_delta_raw[..., :target_len]
+        # 使用可学习的 alpha 系数进行柔和融合
+        alpha = torch.sigmoid(self.wave_residual_alpha_scale)
+        wave_delta = alpha * wave_delta_raw
+        fused_wave = base_wave + wave_delta
+        return fused_wave, wave_delta
 
     def _apply_trainable_param_patterns(self, patterns: Iterable[str]) -> None:
         normalized = [p for p in patterns if isinstance(p, str) and p.strip()]
@@ -273,14 +383,112 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         total_loss = ce_loss
         self.log(f"{stage}/ce_loss", ce_loss, prog_bar=True, sync_dist=True)
 
-        # 2. 连续残差 Loss (补全高频相位)
-        if residual_pred is not None:
-            y_q_sum = y_q.sum(dim=2) if y_q.ndim == 4 and y_q.shape[2] == K else y_q.sum(dim=1)
-            # 量化残差 (Residual) = 真实波形隐特征 - 量化破坏后的特征
-            true_residual = (y_lat_clean - y_q_sum).detach()
+        y_q_sum = self._sum_quantized_latent(y_q, K)
+
+        if self.wave_residual_enabled:
+            base_wave = self._decode_latent_to_wave(y_q_sum.detach(), target_length=y.shape[-1])
+            y_pred, wave_delta = self._predict_wave_residual(x, base_wave, residual_pred)
             
+            min_len = min(base_wave.shape[-1], y.shape[-1])
+            base_wave = base_wave[..., :min_len]
+            y_pred = y_pred[..., :min_len]
+            y_loss_target = y[..., :min_len]
+            wave_residual_target = (y_loss_target - base_wave).detach()
+
+            if wave_delta is not None:
+                wave_delta = wave_delta[..., :min_len]
+                
+                if self.residual_l1_weight > 0:
+                    res_loss = F.l1_loss(wave_delta, wave_residual_target)
+                    total_loss = total_loss + self.residual_l1_weight * res_loss
+                    self.log(f"{stage}/res_loss", res_loss, prog_bar=True, sync_dist=True)
+
+                if self.residual_cos_weight > 0:
+                    res_cos = 1.0 - F.cosine_similarity(
+                        wave_delta.flatten(1), wave_residual_target.flatten(1), dim=1
+                    ).mean()
+                    total_loss = total_loss + self.residual_cos_weight * res_cos
+                    self.log(f"{stage}/res_cos_loss", res_cos, prog_bar=False, sync_dist=True)
+
+                if self.residual_std_weight > 0:
+                    pred_std = wave_delta.std(dim=-1).mean(dim=1)
+                    tgt_std = wave_residual_target.std(dim=-1).mean(dim=1)
+                    res_std = F.l1_loss(pred_std, tgt_std)
+                    total_loss = total_loss + self.residual_std_weight * res_std
+                    self.log(f"{stage}/res_std_loss", res_std, prog_bar=False, sync_dist=True)
+
+                if quality_pred is not None and self.quality_branch_weight > 0:
+                    local_err = (wave_delta.detach() - wave_residual_target).abs().mean(dim=1, keepdim=True)
+                    err_ref = local_err.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+                    quality_target = torch.exp(-local_err / err_ref).clamp(min=0.0, max=1.0)
+                    quality_loss = F.l1_loss(quality_pred, quality_target)
+                    total_loss = total_loss + self.quality_branch_weight * quality_loss
+                    self.log(f"{stage}/quality_loss", quality_loss, prog_bar=False, sync_dist=True)
+
+                    if self.quality_smooth_weight > 0 and quality_pred.shape[-1] > 1:
+                        q_smooth = (quality_pred[..., 1:] - quality_pred[..., :-1]).abs().mean()
+                        total_loss = total_loss + self.quality_smooth_weight * q_smooth
+                        self.log(f"{stage}/quality_smooth", q_smooth, prog_bar=False, sync_dist=True)
+
+            if self.spec_loss is not None and self.spec_loss_weight > 0:
+                spec_losses = self.spec_loss(y_pred, y_loss_target)
+                spec_main = spec_losses["loss"]
+                total_loss = total_loss + self.spec_loss_weight * spec_main
+                self.log(f"{stage}/spec_loss", spec_main, prog_bar=True, sync_dist=True)
+
+            if self.wave_l1_weight > 0:
+                wave_l1 = F.l1_loss(y_pred, y_loss_target)
+                total_loss = total_loss + self.wave_l1_weight * wave_l1
+                self.log(f"{stage}/wave_l1", wave_l1, prog_bar=False, sync_dist=True)
+
+            if self.si_sdr_weight > 0:
+                si_sdr_loss = self._si_sdr_loss(y_pred, y_loss_target)
+                total_loss = total_loss + self.si_sdr_weight * si_sdr_loss
+                self.log(f"{stage}/si_sdr_loss", si_sdr_loss, prog_bar=True, sync_dist=True)
+
+            if (
+                stage == "train"
+                and self.metricgan_plus_enabled
+                and self.metric_discriminator is not None
+                and self.metric_disc_optimizer is not None
+                and self.metricgan_weight > 0
+            ):
+                self.metric_discriminator.to(y_pred.device)
+                should_update_disc = (
+                    self.global_step >= self.metricgan_start_step
+                    and self.metricgan_update_every > 0
+                    and (self.global_step % self.metricgan_update_every == 0)
+                )
+
+                metric_items = max(1, self.metricgan_batch_items)
+                y_sub = y[:metric_items]
+                y_pred_sub = y_pred[:metric_items]
+
+                if should_update_disc:
+                    with torch.no_grad():
+                        metric_target = self._pesq_target(y_pred_sub, y_sub, max_items=metric_items)
+                    disc_pred = self.metric_discriminator(y_pred_sub.detach(), y_sub.detach())
+                    disc_loss = F.mse_loss(disc_pred, metric_target)
+                    self.metric_disc_optimizer.zero_grad(set_to_none=True)
+                    disc_loss.backward()
+                    self.metric_disc_optimizer.step()
+                    self.log(f"{stage}/metric_disc_loss", disc_loss.detach(), prog_bar=False, sync_dist=True)
+
+                for p in self.metric_discriminator.parameters():
+                    p.requires_grad_(False)
+                metric_reward = self.metric_discriminator(y_pred_sub, y_sub).mean()
+                metric_gen_loss = -metric_reward
+                total_loss = total_loss + self.metricgan_weight * metric_gen_loss
+                self.log(f"{stage}/metric_reward", metric_reward.detach(), prog_bar=True, sync_dist=True)
+                self.log(f"{stage}/metric_gen_loss", metric_gen_loss.detach(), prog_bar=False, sync_dist=True)
+                for p in self.metric_discriminator.parameters():
+                    p.requires_grad_(True)
+        elif residual_pred is not None:
+            # 旧的 latent 残差路径保留作 fallback。
+            true_residual = (y_lat_clean - y_q_sum).detach()
+
             res_loss = F.l1_loss(residual_pred, true_residual)
-            total_loss = total_loss + 10.0 * res_loss
+            total_loss = total_loss + self.residual_l1_weight * res_loss
             self.log(f"{stage}/res_loss", res_loss, prog_bar=True, sync_dist=True)
 
             if self.residual_cos_weight > 0:
@@ -310,17 +518,27 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                     total_loss = total_loss + self.quality_smooth_weight * q_smooth
                     self.log(f"{stage}/quality_smooth", q_smooth, prog_bar=False, sync_dist=True)
 
-            if self.spec_loss is not None and self.spec_loss_weight > 0:
-                pred_lat = y_q_sum + residual_pred
-                if hasattr(self.nac, "generator"):
-                    y_pred = self.nac.generator(pred_lat)
+            if (self.spec_loss is not None and self.spec_loss_weight > 0) or self.wave_l1_weight > 0 or self.si_sdr_weight > 0:
+                if self.enable_latent_residual_add:
+                    safe_residual, train_ratio = self._limit_residual_energy(
+                        y_q_sum.detach(), residual_pred, max(self.max_residual_ratio, 1e-6)
+                    )
+                    pred_lat = y_q_sum.detach() + safe_residual
+                    self.log(f"{stage}/res_ratio_train", train_ratio.mean(), prog_bar=False, sync_dist=True)
                 else:
-                    y_pred = self.nac.decode(pred_lat, no_sum=False, domain="q")
-                y_pred = y_pred[..., : y.shape[-1]]
-                spec_losses = self.spec_loss(y_pred, y)
-                spec_main = spec_losses["loss"]
-                total_loss = total_loss + self.spec_loss_weight * spec_main
-                self.log(f"{stage}/spec_loss", spec_main, prog_bar=True, sync_dist=True)
+                    pred_lat = y_q_sum.detach()
+                y_pred = self._decode_latent_to_wave(pred_lat, target_length=y.shape[-1])
+
+                if self.spec_loss is not None and self.spec_loss_weight > 0:
+                    spec_losses = self.spec_loss(y_pred, y)
+                    spec_main = spec_losses["loss"]
+                    total_loss = total_loss + self.spec_loss_weight * spec_main
+                    self.log(f"{stage}/spec_loss", spec_main, prog_bar=True, sync_dist=True)
+
+                if self.wave_l1_weight > 0:
+                    wave_l1 = F.l1_loss(y_pred, y)
+                    total_loss = total_loss + self.wave_l1_weight * wave_l1
+                    self.log(f"{stage}/wave_l1", wave_l1, prog_bar=False, sync_dist=True)
 
                 if self.si_sdr_weight > 0:
                     si_sdr_loss = self._si_sdr_loss(y_pred, y)
@@ -368,19 +586,20 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.log(f"{stage}/loss", total_loss, prog_bar=False, sync_dist=True)
 
         if metrics or (stage == "val" and batch_idx == 0):
-            y_lat_fused = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
-            if hasattr(self.nac, "generator"):
-                y_hat = self.nac.generator(y_lat_fused)
+            solve_out = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat, x_wave=x)
+            if self.wave_residual_enabled:
+                y_hat = solve_out
             else:
-                y_hat = self.nac.decode(y_lat_fused, no_sum=False, domain="q")
-                
+                y_lat_fused = solve_out
+                y_hat = self._decode_latent_to_wave(y_lat_fused, target_length=y.shape[-1])
+
             y_hat = y_hat[..., :y.shape[-1]]
             return {"loss": total_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
             
         return {"loss": total_loss}, {}, {}
 
     @torch.no_grad()
-    def solve(self, x_tok, x_q, num_steps, x_cont=None):
+    def solve(self, x_tok, x_q, num_steps, x_cont=None, x_wave=None):
         B, K, L = x_tok.shape
         y_tok = torch.full_like(x_tok, self.mask_token)
         import math
@@ -443,7 +662,16 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         if y_q_discrete.ndim == 4:
             y_q_discrete = y_q_discrete.sum(dim=1) if y_q_discrete.shape[1] == K else y_q_discrete.sum(dim=2)
 
+        if self.wave_residual_enabled and x_wave is not None:
+            base_wave = self._decode_latent_to_wave(y_q_discrete, target_length=x_wave.shape[-1])
+            wave_fused, _ = self._predict_wave_residual(x_wave, base_wave, final_residual)
+            return wave_fused[..., : x_wave.shape[-1]]
+
         if isinstance(final_residual, Tensor) and self.fidelity_gate_enabled:
+            if not self.enable_latent_residual_add:
+                self._last_fidelity_gate_mean = 0.0
+                return y_q_discrete
+
             # 保真门：置信度越高、残差能量越低，连续分支注入越强；否则自动收缩，保护主干语义与时域保真。
             base_rms = y_q_discrete.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-8)
             res_rms = final_residual.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-8)
@@ -477,11 +705,21 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 )
 
             self._last_fidelity_gate_mean = float(fidelity_gate.mean().item())
-            return y_q_discrete + fidelity_gate * final_residual
+            safe_residual, infer_ratio = self._limit_residual_energy(
+                y_q_discrete, fidelity_gate * final_residual, max(self.max_residual_ratio, 1e-6)
+            )
+            self._last_residual_ratio_mean = float(infer_ratio.mean().item())
+            return y_q_discrete + safe_residual
 
         # 干净的离散语义骨架 + 连续网络提取的高清相位残差
         if isinstance(final_residual, Tensor):
-            return y_q_discrete + final_residual
+            if not self.enable_latent_residual_add:
+                return y_q_discrete
+            safe_residual, infer_ratio = self._limit_residual_energy(
+                y_q_discrete, final_residual, max(self.max_residual_ratio, 1e-6)
+            )
+            self._last_residual_ratio_mean = float(infer_ratio.mean().item())
+            return y_q_discrete + safe_residual
         return y_q_discrete
 
     def forward(self, x: torch.Tensor, return_nfe: bool = False, **kwargs):
@@ -491,13 +729,12 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         x_lat = self.nac.encoder(x_pad)
         x_tok, x_q = self.nac.encode(x_pad, no_sum=True, domain="q")
         
-        # solve 现在返回的是结合了高频残差的完美连续特征
-        y_lat_fused = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat)
-        
-        if hasattr(self.nac, "generator"):
-            y_hat_pad = self.nac.generator(y_lat_fused)
+        # solve 在 wave_residual_enabled 时直接返回波形晚期融合结果。
+        solve_out = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat, x_wave=x_pad)
+        if self.wave_residual_enabled:
+            y_hat_pad = solve_out
         else:
-            y_hat_pad = self.nac.decode(y_lat_fused, no_sum=False, domain="q")
+            y_hat_pad = self._decode_latent_to_wave(solve_out, target_length=x_pad.shape[-1])
             
         y_hat = y_hat_pad[..., : y_hat_pad.shape[-1] - n_pad]
         if return_nfe: return y_hat, self.num_steps

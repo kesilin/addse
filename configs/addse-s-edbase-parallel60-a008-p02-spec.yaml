@@ -33,7 +33,7 @@ lm:
     gate_kernel_size: 3
     use_pitch_aware_gate: true
     pitch_gain: 0.2
-    interaction_on_logits: false
+    interaction_on_logits: true
     use_semantic_guidance: true
     use_snr_adaptive_gate: true
     use_interaction_alignment_gate: true
@@ -49,13 +49,27 @@ lm:
     fs: ${fs}
     frame_lengths: [127, 257, 509, 1021]
     n_mels: [32, 64, 128, 256]
-  spec_loss_weight: 0.05
-  si_sdr_weight: 0.02
-  residual_cos_weight: 0.1
-  residual_std_weight: 0.04
+  spec_loss_weight: 2.0
+  si_sdr_weight: 2.0
+  residual_l1_weight: 2.0
+  wave_l1_weight: 1.5
+  residual_cos_weight: 0.0
+  residual_std_weight: 0.0
   residual_ema_decay: 0.8
-  quality_branch_weight: 0.1
-  quality_smooth_weight: 0.02
+  quality_branch_weight: 0.0
+  quality_smooth_weight: 0.0
+  wave_residual_enabled: true
+  wave_residual_num_filters: 128
+  wave_residual_filter_size: 16
+  wave_residual_hop_size: 8
+  wave_residual_bottleneck_channels: 64
+  wave_residual_hidden_channels: 128
+  wave_residual_skip_channels: 64
+  wave_residual_kernel_size: 3
+  wave_residual_layers: 4
+  wave_residual_repeats: 2
+  enable_latent_residual_add: false
+  max_residual_ratio: 0.03
   fidelity_gate_enabled: true
   fidelity_gate_min: 0.2
   fidelity_gate_max: 1.0
