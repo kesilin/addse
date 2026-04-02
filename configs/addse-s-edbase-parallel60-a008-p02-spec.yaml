@@ -33,6 +33,9 @@ lm:
     gate_kernel_size: 3
     use_pitch_aware_gate: true
     pitch_gain: 0.2
+    interaction_on_logits: false
+    use_semantic_guidance: true
+    use_snr_adaptive_gate: true
     use_interaction_alignment_gate: true
     use_interaction_confidence_gate: true
     use_band_quality_gate: true
@@ -55,10 +58,13 @@ lm:
   quality_smooth_weight: 0.02
   fidelity_gate_enabled: true
   fidelity_gate_min: 0.2
-  fidelity_gate_max: 0.6
+  fidelity_gate_max: 1.0
   fidelity_conf_threshold: 0.75
   fidelity_conf_sharpness: 10.0
   fidelity_energy_ref: 0.2
+  snr_adaptive_fusion: true
+  snr_adaptive_threshold: 0.8
+  snr_adaptive_sharpness: 5.0
   deterministic_eval: true
   metricgan_plus_enabled: false
   metricgan_weight: 0.0
@@ -66,7 +72,7 @@ lm:
   metricgan_update_every: 8
   metricgan_start_step: 100
   metricgan_batch_items: 1
-  trainable_param_patterns: ["refiner", "freq_gate", "pitch_gate", "alpha_proj", "parallel_proj", "interaction_alpha"]
+  trainable_param_patterns: ["refiner", "freq_gate", "pitch_gate", "quality_head", "snr_gate_proj", "interaction_proj", "parallel_proj", "interaction_alpha"]
   num_steps: 128
   block_size: 200
   optimizer:

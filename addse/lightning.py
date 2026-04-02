@@ -148,6 +148,9 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.fidelity_conf_threshold = float(kwargs.get("fidelity_conf_threshold", 0.75))
         self.fidelity_conf_sharpness = float(kwargs.get("fidelity_conf_sharpness", 10.0))
         self.fidelity_energy_ref = float(kwargs.get("fidelity_energy_ref", 0.25))
+        self.snr_adaptive_fusion = bool(kwargs.get("snr_adaptive_fusion", True))
+        self.snr_adaptive_threshold = float(kwargs.get("snr_adaptive_threshold", 0.8))
+        self.snr_adaptive_sharpness = float(kwargs.get("snr_adaptive_sharpness", 5.0))
         self.deterministic_eval = bool(kwargs.get("deterministic_eval", False))
         self.metricgan_plus_enabled = bool(kwargs.get("metricgan_plus_enabled", False))
         self.metricgan_weight = float(kwargs.get("metricgan_weight", 0.0))
@@ -459,6 +462,20 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 min=self.fidelity_gate_min,
                 max=self.fidelity_gate_max,
             )
+
+            if self.snr_adaptive_fusion and x_cont is not None:
+                sem_rms = y_q_discrete.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-8)
+                noi_rms = (x_cont - y_q_discrete).pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-8)
+                noise_ratio = noi_rms / sem_rms
+                snr_gate = torch.sigmoid(
+                    self.snr_adaptive_sharpness * (noise_ratio - self.snr_adaptive_threshold)
+                ).to(fidelity_gate.dtype)
+                fidelity_gate = torch.clamp(
+                    fidelity_gate * snr_gate,
+                    min=self.fidelity_gate_min,
+                    max=self.fidelity_gate_max,
+                )
+
             self._last_fidelity_gate_mean = float(fidelity_gate.mean().item())
             return y_q_discrete + fidelity_gate * final_residual
 

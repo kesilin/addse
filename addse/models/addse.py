@@ -67,9 +67,12 @@ class ADDSERQDiTParallel(ADDSERQDiT):
         hidden = kwargs.get("adapter_hidden", 256)
         num_codebooks = kwargs.get("num_codebooks", 4)
         
+        self.use_semantic_guidance = bool(kwargs.get("use_semantic_guidance", True))
+        refiner_in_channels = in_channels * 2 if self.use_semantic_guidance else in_channels
+
         # 感受野 (Receptive Field) 指数级扩大的残差网络
         layers = []
-        layers.append(nn.Conv1d(in_channels, hidden, 3, padding=1))
+        layers.append(nn.Conv1d(refiner_in_channels, hidden, 3, padding=1))
         layers.append(nn.GELU())
         # 使用空洞卷积 (Dilation) 捕捉长距离相位和上下文信息
         for dilation in [1, 2, 4, 8, 16, 32]:
@@ -90,6 +93,8 @@ class ADDSERQDiTParallel(ADDSERQDiT):
         self.dynamic_alpha = bool(kwargs.get("dynamic_alpha", False))
         self.alpha_max = float(kwargs.get("alpha_max", 0.08))
         self.pitch_gain = float(kwargs.get("pitch_gain", 0.1))
+        self.interaction_on_logits = bool(kwargs.get("interaction_on_logits", False))
+        self.use_snr_adaptive_gate = bool(kwargs.get("use_snr_adaptive_gate", True))
         self.use_interaction_alignment_gate = bool(kwargs.get("use_interaction_alignment_gate", True))
         self.use_interaction_confidence_gate = bool(kwargs.get("use_interaction_confidence_gate", True))
         self.use_band_quality_gate = bool(kwargs.get("use_band_quality_gate", True))
@@ -109,6 +114,12 @@ class ADDSERQDiTParallel(ADDSERQDiT):
         )
 
         self.alpha_proj = nn.Sequential(
+            nn.Conv1d(2 * in_channels, hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(hidden, 1, kernel_size=1),
+        )
+
+        self.snr_gate_proj = nn.Sequential(
             nn.Conv1d(2 * in_channels, hidden, kernel_size=1),
             nn.GELU(),
             nn.Conv1d(hidden, 1, kernel_size=1),
@@ -144,6 +155,8 @@ class ADDSERQDiTParallel(ADDSERQDiT):
                 nn.init.zeros_(self.parallel_proj.bias)
             nn.init.zeros_(self.quality_head[-1].weight)
             nn.init.zeros_(self.quality_head[-1].bias)
+            nn.init.zeros_(self.snr_gate_proj[-1].weight)
+            nn.init.zeros_(self.snr_gate_proj[-1].bias)
 
     @staticmethod
     def _adain_align(source: Tensor, target: Tensor, eps: float = 1e-5) -> Tensor:
@@ -161,8 +174,12 @@ class ADDSERQDiTParallel(ADDSERQDiT):
             if c_cont.ndim == 4:
                 c_cont = c_cont.sum(dim=2) if c_cont.shape[2] > 1 else c_cont.squeeze(2)
             
+            # 语义图纸来自主干预测语义，但用 detach 截断梯度，防止连续分支反向污染离散主干。
+            semantic_cont = z_base.detach().mean(dim=2)
+            refiner_input = torch.cat([c_cont, semantic_cont], dim=1) if self.use_semantic_guidance else c_cont
+
             # 2. 连续支路预测高频量化残差！
-            residual_pred = self.refiner(c_cont) # (B, C, L)
+            residual_pred = self.refiner(refiner_input) # (B, C, L)
             quality_map = torch.sigmoid(self.quality_head(residual_pred))
 
             base_cont = z_base.mean(dim=2)
@@ -214,10 +231,18 @@ class ADDSERQDiTParallel(ADDSERQDiT):
                 local_quality_gate = (band_gate * quality_gate).clamp(min=self.interaction_gate_floor, max=1.0)
                 interaction_gate = interaction_gate * local_quality_gate
 
+            if self.use_snr_adaptive_gate:
+                snr_feat = torch.cat([semantic_cont.detach(), c_cont], dim=1)
+                snr_gate = torch.sigmoid(self.snr_gate_proj(snr_feat)).unsqueeze(2)
+                snr_gate = snr_gate.clamp(min=self.interaction_gate_floor, max=1.0)
+                interaction_gate = interaction_gate * snr_gate
+
             residual_4d = residual_4d * interaction_gate
             
-            # 3. 平滑交互：连续残差引导离散 logits
-            if self.fusion_mode == "film" and self.parallel_proj is not None:
+            # 3. 可选交互：默认关闭 logits 空间交互，采用正交解耦。
+            if not self.interaction_on_logits:
+                logits = z_base
+            elif self.fusion_mode == "film" and self.parallel_proj is not None:
                 gamma, beta = self.parallel_proj(residual_pred).chunk(2, dim=1)
                 gamma = torch.tanh(gamma).unsqueeze(2)
                 beta = beta.unsqueeze(2)
