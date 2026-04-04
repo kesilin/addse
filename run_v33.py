@@ -18,6 +18,8 @@ if __name__ == "__main__":
     parser.add_argument("--train-epochs", type=int, default=10)
     parser.add_argument("--train-batches", type=int, default=5)
     parser.add_argument("--train-groups", type=int, default=150, help="Synthetic training groups / dataset length")
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--train-shuffle", action="store_true", help="Enable train dataloader shuffle")
     parser.add_argument("--eval-examples", type=int, default=60)
     parser.add_argument("--eval-steps", type=int, default=200, help="Diffusion steps during eval; use 200 for strict evaluation")
     parser.add_argument("--val-every", type=int, default=1)
@@ -33,6 +35,15 @@ if __name__ == "__main__":
     parser.add_argument("--si-sdr-weight", type=float, default=0.2, help="Wave-domain SI-SDR weight for this run")
     parser.add_argument("--alpha-init-prob", type=float, default=0.05, help="Initial sigmoid probability for alpha gates")
     parser.add_argument("--print-alpha", action="store_true", help="Print alpha logs in progress bar (handled in lightning logs)")
+
+    # ===== SAD-RVQ Scheme Selection =====
+    parser.add_argument("--sad-rvq-scheme", type=str, default="baseline", choices=["baseline", "a", "b", "c", "d"],
+                       help="Which SAD-RVQ scheme to use (baseline, a=entropy, b=dual-head, c=progressive, d=gating)")
+    parser.add_argument("--sad-rvq-scheme-a-weight", type=float, default=0.5,
+                       help="Weight for Scheme A entropy boost loss")
+    parser.add_argument("--sad-rvq-scheme-d-gate-entropy-weight", type=float, default=0.1,
+                       help="Weight for Scheme D gate entropy regularization")
+
     args = parser.parse_args()
 
     # ====================================================================
@@ -60,8 +71,9 @@ if __name__ == "__main__":
             # ==== 1. 训练轮次与数据量精准控制 ====
             f"++trainer.max_epochs={args.train_epochs}",
             f"++trainer.limit_train_batches={args.train_batches}",
-            "++dm.train_dataloader.batch_size=8",
-            f"++dm.train_dataset.length={max(args.train_groups, args.train_batches * 8)}",
+            f"++dm.train_dataloader.batch_size={args.batch_size}",
+            f"++dm.train_dataloader.shuffle={str(args.train_shuffle).lower()}",
+            f"++dm.train_dataset.length={max(args.train_groups, args.train_batches * args.batch_size)}",
 
             # ==== 1.1 P-SSA 训练超参（从 Oracle 过渡到真实训练） ====
             "++lm.spec_loss_weight=1.0",
@@ -86,6 +98,12 @@ if __name__ == "__main__":
             f"++trainer.check_val_every_n_epoch={args.val_every}",
             "++dm.train_dataset.resume=false",
             "++dm.val_dataset.resume=false",
+
+            # ==== 4. SAD-RVQ 方案选择 ====
+            f"++lm.sad_rvq_scheme={args.sad_rvq_scheme}",
+            f"++lm.sad_rvq_scheme_d_enabled={str(args.sad_rvq_scheme == 'd').lower()}",
+            f"++lm.sad_rvq_scheme_a_weight={args.sad_rvq_scheme_a_weight}",
+            f"++lm.sad_rvq_scheme_d_gate_entropy_weight={args.sad_rvq_scheme_d_gate_entropy_weight}",
         ],
         overwrite=args.reset_log_dir, wandb=False
     )
@@ -104,6 +122,10 @@ if __name__ == "__main__":
                 f"lm.wave_residual_enabled={str((not args.disable_wave_residual)).lower()}",
                 f"eval.dsets.edbase-local.length={args.eval_examples}",
                 f"lm.deterministic_eval={str(args.deterministic_eval).lower()}",
+                f"lm.sad_rvq_scheme={args.sad_rvq_scheme}",
+                f"lm.sad_rvq_scheme_d_enabled={str(args.sad_rvq_scheme == 'd').lower()}",
+                f"lm.sad_rvq_scheme_a_weight={args.sad_rvq_scheme_a_weight}",
+                f"lm.sad_rvq_scheme_d_gate_entropy_weight={args.sad_rvq_scheme_d_gate_entropy_weight}",
             ],
             output_dir=args.output_dir,
             output_db=args.output_db,

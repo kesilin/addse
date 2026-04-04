@@ -1,0 +1,7 @@
+Architecture Surgery Report
+================================================================================
+MI low=0.326744 high=0.205736 ratio=0.6297
+Best layer={'layer': 'input_latent', 'strength': 1.0, 'pesq': 1.111764669418335, 'si_sdr': -4.609502553939819, 'estoi': 0.39712453044143775}
+Best operator={'op': 'add', 'alpha': 0.05, 'pesq': 1.1063318252563477, 'estoi': 0.35282503543799293, 'si_sdr': -3.538309931755066, 'sdr': -1.2329299002885818}
+Best temperature={'mode': 'static:1.00', 'pesq': 1.3752503395080566, 'estoi': 0.6313825102537599, 'si_sdr': -1.6001161932945251, 'sdr': 0.9017425030469894}
+Best grouped={'method': 'rvq_split', 'pesq_all': 1.5911047061284382, 'si_sdr_all': -5.896950004001458, 'pesq_low_snr': 1.3354987303415935, 'pesq_mid_snr': 1.625120963369097, 'pesq_high_snr': 1.8554567694664001, 'pesq_energy_low': 1.3426985442638397, 'pesq_energy_mid': 1.9335454106330872, 'pesq_energy_high': 1.497070163488388}

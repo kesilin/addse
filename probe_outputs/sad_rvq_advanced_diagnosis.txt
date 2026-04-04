@@ -1,0 +1,24 @@
+SAD-RVQ Advanced Diagnosis Report
+================================================================================
+
+[Oracle Ceiling]
+前3层DiT预测 + 后5层完美Clean Token的理论上限
+PESQ=3.300 SI-SDR=1.824 ESTOI=0.902
+
+[Dynamic Routing]
+高频能量大的帧用早期接管(N=3), 低频帧用晚期接管(N=6)
+Average PESQ=1.726
+  Sample 0: PESQ=1.440 SI-SDR=-2.618
+  Sample 1: PESQ=2.088 SI-SDR=-4.915
+  Sample 2: PESQ=1.649 SI-SDR=-5.879
+
+[VAD Masking]
+无声段回退给主干(DiT only), 有声段用完美后5层
+Average PESQ=1.658
+  Sample 0: PESQ=1.326 SI-SDR=-4.256
+  Sample 1: PESQ=2.122 SI-SDR=-4.400
+  Sample 2: PESQ=1.527 SI-SDR=-5.337
+
+[Logit Smoothing]
+时间轴平滑处理
+PESQ=1.366 SI-SDR=-0.369
