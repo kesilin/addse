@@ -52,7 +52,7 @@ class SchemeDLearnableGatingRouter(nn.Module):
         self.gate_net = nn.Sequential(
             nn.Linear(feature_dim, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, num_codebooks),
+            nn.Linear(128, 1),
         )
     
     def forward(self, acoustic_features: torch.Tensor) -> torch.Tensor:
@@ -65,13 +65,12 @@ class SchemeDLearnableGatingRouter(nn.Module):
         feat_flat = acoustic_features.reshape(-1, shape[-1])
         
         # Compute gate logits
-        gate_logits = self.gate_net(feat_flat)  # [B*K*L, K]
+        gate_logits = self.gate_net(feat_flat)  # [B*K*L, 1]
         
         # Reshape back and apply sigmoid
         if len(shape) == 4:
             B, K, L, _ = shape
             gate_logits = gate_logits.reshape(B, K, L, -1)
-            # Average across dimension and use first output as gate
             gate = torch.sigmoid(gate_logits[:, :, :, 0:1])  # [B, K, L, 1]
         else:
             # Fallback for [B, L, F]
@@ -239,12 +238,38 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.sad_rvq_scheme_a_weight = float(kwargs.get("sad_rvq_scheme_a_weight", 0.5))
         self.sad_rvq_scheme_d_enabled = bool(kwargs.get("sad_rvq_scheme_d_enabled", False))
         self.sad_rvq_scheme_d_gate_entropy_weight = float(kwargs.get("sad_rvq_scheme_d_gate_entropy_weight", 0.1))
+        self.sad_rvq_scheme_d_acoustic_weight = float(kwargs.get("sad_rvq_scheme_d_acoustic_weight", 0.5))
+        self.sad_rvq_scheme_d_gate_polar_weight = float(kwargs.get("sad_rvq_scheme_d_gate_polar_weight", 0.1))
+        self.sad_rvq_scheme_d_acoustic_lr_scale = float(kwargs.get("sad_rvq_scheme_d_acoustic_lr_scale", 1.0))
+        self.sad_rvq_scheme_g_entropy_quantile = float(kwargs.get("sad_rvq_scheme_g_entropy_quantile", 0.5))
+        self.sad_rvq_scheme_h_min_temp = float(kwargs.get("sad_rvq_scheme_h_min_temp", 0.1))
+        self.sad_rvq_scheme_d_final_weight = float(kwargs.get("sad_rvq_scheme_d_final_weight", 1.0))
+        self.sad_rvq_scheme_train_mode = str(kwargs.get("sad_rvq_scheme_train_mode", "normal")).lower()
+        self.sad_rvq_freeze_main_model = bool(kwargs.get("sad_rvq_freeze_main_model", False))
         
         # Scheme D: Initialize learnable router
-        if self.sad_rvq_scheme == "d" or self.sad_rvq_scheme_d_enabled:
+        scheme_with_acoustic = self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} or self.sad_rvq_scheme_d_enabled
+        if scheme_with_acoustic:
             self.scheme_d_router = SchemeDLearnableGatingRouter(num_codebooks=8, feature_dim=256)
+            self.scheme_d_acoustic_head = nn.Sequential(
+                nn.Linear(256, 256),
+                nn.GELU(),
+                nn.Linear(256, int(getattr(self.model, "output_channels", 1024))),
+            )
+
+            # Optional gradient scaling to give Scheme-D acoustic branch an effectively higher LR.
+            if self.sad_rvq_scheme_d_acoustic_lr_scale > 1.0:
+                scale = self.sad_rvq_scheme_d_acoustic_lr_scale
+                for p in list(self.scheme_d_router.parameters()) + list(self.scheme_d_acoustic_head.parameters()):
+                    if p.requires_grad:
+                        p.register_hook(lambda g, s=scale: g * s)
         else:
             self.scheme_d_router = None
+            self.scheme_d_acoustic_head = None
+
+        if self.sad_rvq_freeze_main_model:
+            for p in self.model.parameters():
+                p.requires_grad = False
         
         if self.wave_residual_enabled:
             wave_norm = functools.partial(nn.BatchNorm1d, momentum=0.1)
@@ -338,9 +363,6 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     ) -> tuple[Tensor, Tensor | None]:
         if not self.wave_residual_enabled or self.wave_residual_net is None:
             return base_wave, None
-
-        base_wave = base_wave.detach()
-        x_wave = x_wave.detach()
         target_len = base_wave.shape[-1]
         
         if residual_hint is None:
@@ -405,7 +427,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         if matched == 0:
             raise ValueError(f"No model parameters matched trainable_param_patterns: {normalized}")
 
-    def log_score(self, y_q, x_q, x_cont=None):
+    def log_score(self, y_q, x_q, x_cont=None, return_raw_logits: bool = False):
         x_c_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
         def model_wrapper(y_s, x_s, c_s):
             return self.model(y_s, x_s, None, c_cont=c_s)
@@ -418,11 +440,94 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             else:
                 logits, residual = result
                 quality_map = None
-            log_p = logits.moveaxis(1, -1).log_softmax(dim=-1)
+            logits_raw = logits.moveaxis(1, -1)
+            log_p = logits_raw.log_softmax(dim=-1)
+            if return_raw_logits:
+                return log_p, residual, quality_map, logits_raw
             return log_p, residual, quality_map
         else:
-            log_p = result.moveaxis(1, -1).log_softmax(dim=-1)
+            logits_raw = result.moveaxis(1, -1)
+            log_p = logits_raw.log_softmax(dim=-1)
+            if return_raw_logits:
+                return log_p, None, None, logits_raw
             return log_p, None, None
+
+    def _build_scheme_d_acoustic_logits(self, x_lat: Tensor, k_4plus: int, L: int) -> Tensor:
+        feat_dim = 256
+        acoustic_feat = F.interpolate(x_lat, size=L, mode="nearest").transpose(1, 2)  # [B, L, C]
+        if acoustic_feat.shape[-1] < feat_dim:
+            acoustic_feat = F.pad(acoustic_feat, (0, feat_dim - acoustic_feat.shape[-1]))
+        elif acoustic_feat.shape[-1] > feat_dim:
+            acoustic_feat = acoustic_feat[..., :feat_dim]
+        acoustic_logits = self.scheme_d_acoustic_head(acoustic_feat)  # [B, L, V]
+        return acoustic_logits.unsqueeze(1).expand(-1, k_4plus, -1, -1)  # [B, K4, L, V]
+
+    def _scheme_d_fuse_logits(
+        self,
+        base_logits: Tensor,
+        x_lat: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        # base_logits: [B, K, L, V]
+        B, K, L, _ = base_logits.shape
+        if K <= 3 or self.scheme_d_router is None or self.scheme_d_acoustic_head is None:
+            return base_logits, None, None
+
+        # Router gate for all codebooks, use only post-3 layers for enhancement
+        feat_dim = 256
+        acoustic_feat = F.interpolate(x_lat, size=L, mode="nearest").transpose(1, 2)
+        if acoustic_feat.shape[-1] < feat_dim:
+            acoustic_feat = F.pad(acoustic_feat, (0, feat_dim - acoustic_feat.shape[-1]))
+        elif acoustic_feat.shape[-1] > feat_dim:
+            acoustic_feat = acoustic_feat[..., :feat_dim]
+        acoustic_feat_expanded = acoustic_feat.unsqueeze(1).expand(-1, K, -1, -1)
+        acoustic_logits_4plus = self._build_scheme_d_acoustic_logits(x_lat, K - 3, L)
+        fused_logits = base_logits.clone()
+
+        scheme = self.sad_rvq_scheme
+        router_gate = None
+
+        # Scheme E: static takeover on post-3 layers
+        if scheme == "e":
+            fused_logits[:, 3:, :, :] = acoustic_logits_4plus
+            return fused_logits, acoustic_logits_4plus, router_gate
+
+        # Scheme F: residual logit addition on post-3 layers
+        if scheme == "f":
+            fused_logits[:, 3:, :, :] = base_logits[:, 3:, :, :] + acoustic_logits_4plus
+            return fused_logits, acoustic_logits_4plus, router_gate
+
+        # Scheme G: entropy-guided hard routing (non-learnable gate)
+        if scheme == "g":
+            probs = F.softmax(base_logits[:, 3:, :, :], dim=-1)
+            entropy = -(probs * torch.log(probs.clamp(min=1e-8))).sum(dim=-1, keepdim=True)
+            q = min(max(self.sad_rvq_scheme_g_entropy_quantile, 0.0), 1.0)
+            threshold = torch.quantile(entropy.detach().reshape(-1), q)
+            router_gate = (entropy > threshold).float()
+            fused_logits[:, 3:, :, :] = base_logits[:, 3:, :, :] * (1.0 - router_gate) + acoustic_logits_4plus * router_gate
+            return fused_logits, acoustic_logits_4plus, router_gate
+
+        # Scheme H: temperature annealed soft routing (learnable gate)
+        if scheme == "h":
+            raw_gate_logits = self.scheme_d_router.gate_net(acoustic_feat_expanded.reshape(-1, acoustic_feat_expanded.shape[-1]))
+            raw_gate_logits = raw_gate_logits.reshape(B, K, L, 1)[:, 3:, :, :]
+
+            est_steps = 1
+            trainer_obj = getattr(self, "_trainer", None)
+            if trainer_obj is not None:
+                est_steps = int(getattr(trainer_obj, "estimated_stepping_batches", 0) or 0)
+            est_steps = max(est_steps, 1)
+            progress = min(max(float(self.global_step) / float(est_steps), 0.0), 1.0)
+            temp = max(1.0 - 0.9 * progress, self.sad_rvq_scheme_h_min_temp)
+            router_gate = torch.sigmoid(raw_gate_logits / temp)
+            if trainer_obj is not None:
+                self.log("train/scheme_h_temp" if self.training else "val/scheme_h_temp", temp, prog_bar=False, sync_dist=True)
+            fused_logits[:, 3:, :, :] = base_logits[:, 3:, :, :] * (1.0 - router_gate) + acoustic_logits_4plus * router_gate
+            return fused_logits, acoustic_logits_4plus, router_gate
+
+        # Scheme D(default): soft learnable routing
+        router_gate = self.scheme_d_router(acoustic_feat_expanded)[:, 3:, :, :]  # [B, K4, L, 1]
+        fused_logits[:, 3:, :, :] = base_logits[:, 3:, :, :] * (1.0 - router_gate) + acoustic_logits_4plus * router_gate
+        return fused_logits, acoustic_logits_4plus, router_gate
 
     @staticmethod
     def _si_sdr_loss(pred: Tensor, target: Tensor, eps: float = 1e-8) -> Tensor:
@@ -470,11 +575,12 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         y_lambda_q.masked_fill_(mask.unsqueeze(1), 0)
 
         # 核心前向传播
-        log_p, residual_pred, quality_pred = self.log_score(y_lambda_q, x_q, x_cont=x_lat)
+        log_p, residual_pred, quality_pred, logits_raw = self.log_score(y_lambda_q, x_q, x_cont=x_lat, return_raw_logits=True)
+        logits_for_ce = logits_raw
         
         # 1. 离散 CE Loss (猜词)
-        V = log_p.shape[-1]
-        ce_per_token = F.cross_entropy(log_p.reshape(-1, V), y_tok.reshape(-1), reduction="none").reshape(B, K, L)
+        V = logits_for_ce.shape[-1]
+        ce_per_token = F.cross_entropy(logits_for_ce.reshape(-1, V), y_tok.reshape(-1), reduction="none").reshape(B, K, L)
         ce_loss = (ce_per_token * mask).sum() / (mask.sum() + 1e-8)
         total_loss = ce_loss
         self.log(f"{stage}/ce_loss", ce_loss, prog_bar=True, sync_dist=True)
@@ -482,6 +588,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             mask_4plus = mask[:, 3:, :]
             ce_4plus = (ce_per_token[:, 3:, :] * mask_4plus).sum() / (mask_4plus.sum() + 1e-8)
             self.log(f"{stage}/ce_loss_l4plus", ce_4plus, prog_bar=True, sync_dist=True)
+            self.log(f"{stage}/ce_l4plus_base", ce_4plus, prog_bar=False, sync_dist=True)
         
         # SAD-RVQ Scheme A: Post-5-Layer Enhancement
         if self.sad_rvq_scheme == "a":
@@ -495,31 +602,59 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                     total_loss = total_loss + self.sad_rvq_scheme_a_weight * entropy_boost_loss
                     self.log(f"{stage}/scheme_a_entropy_boost", entropy_boost_loss, prog_bar=True, sync_dist=True)
         
-        # SAD-RVQ Scheme D: Learnable Gating for Soft Fusion
-        if self.sad_rvq_scheme == "d" and self.scheme_d_router is not None:
-            # Build frame-aligned acoustic features with correct [B, K, L, F] shape.
-            feat_dim = min(256, x_lat.shape[1])
-            acoustic_feat = F.interpolate(x_lat, size=L, mode="nearest").transpose(1, 2)  # [B, L, C]
-            if acoustic_feat.shape[-1] < feat_dim:
-                acoustic_feat = F.pad(acoustic_feat, (0, feat_dim - acoustic_feat.shape[-1]))
-            elif acoustic_feat.shape[-1] > feat_dim:
-                acoustic_feat = acoustic_feat[..., :feat_dim]
-            acoustic_feat_expanded = acoustic_feat.unsqueeze(1).expand(-1, K, -1, -1)  # [B, K, L, F]
+        # SAD-RVQ Scheme D/E/F/G/H: post-3-layer fusion family
+        if self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} and self.scheme_d_acoustic_head is not None and K > 3:
+            fused_logits, acoustic_logits_4plus, router_gate = self._scheme_d_fuse_logits(logits_raw, x_lat)
 
-            # Get gate from router
-            gate = self.scheme_d_router(acoustic_feat_expanded)  # [B, K, L, 1]
-            
-            # Log gate statistics
-            gate_mean = gate.mean().detach()
-            gate_std = gate.std().detach()
-            self.log(f"{stage}/scheme_d_gate_mean", gate_mean, prog_bar=True, sync_dist=True)
-            self.log(f"{stage}/scheme_d_gate_std", gate_std, prog_bar=False, sync_dist=True)
-            
-            # Gate entropy regularization: encourage gates to be learned (not stuck at 0 or 1)
-            gate_entropy = -(gate * torch.log(gate.clamp(min=1e-8)) + (1 - gate) * torch.log((1 - gate).clamp(min=1e-8)))
-            gate_entropy_loss = -gate_entropy.mean()  # Minimize to maximize entropy
-            total_loss = total_loss + self.sad_rvq_scheme_d_gate_entropy_weight * gate_entropy_loss
-            self.log(f"{stage}/scheme_d_gate_entropy", gate_entropy_loss, prog_bar=False, sync_dist=True)
+            mask_4plus = mask[:, 3:, :]
+            loss_final_4plus = F.cross_entropy(
+                fused_logits[:, 3:, :, :].reshape(-1, V),
+                y_tok[:, 3:, :].reshape(-1),
+                reduction="none",
+            ).reshape(B, K - 3, L)
+            loss_final_4plus = (loss_final_4plus * mask_4plus).sum() / (mask_4plus.sum() + 1e-8)
+
+            # For E/F/G: single clean objective on post-3 layers.
+            if self.sad_rvq_scheme in {"e", "f", "g"}:
+                total_loss = loss_final_4plus
+                self.log(f"{stage}/scheme_post3_loss", loss_final_4plus, prog_bar=True, sync_dist=True)
+            else:
+                # D/H: dual supervision.
+                loss_acoustic_4plus = F.cross_entropy(
+                    acoustic_logits_4plus.reshape(-1, V),
+                    y_tok[:, 3:, :].reshape(-1),
+                    reduction="none",
+                ).reshape(B, K - 3, L)
+                loss_acoustic_4plus = (loss_acoustic_4plus * mask_4plus).sum() / (mask_4plus.sum() + 1e-8)
+
+                if self.sad_rvq_scheme_train_mode == "acoustic_only":
+                    total_loss = self.sad_rvq_scheme_d_acoustic_weight * loss_acoustic_4plus
+                else:
+                    total_loss = (
+                        self.sad_rvq_scheme_d_final_weight * loss_final_4plus
+                        + self.sad_rvq_scheme_d_acoustic_weight * loss_acoustic_4plus
+                    )
+                self.log(f"{stage}/scheme_d_loss_acoustic_l4plus", loss_acoustic_4plus, prog_bar=True, sync_dist=True)
+            self.log(f"{stage}/scheme_d_loss_final_l4plus", loss_final_4plus, prog_bar=True, sync_dist=True)
+            self.log(f"{stage}/ce_l4plus_fused", loss_final_4plus, prog_bar=False, sync_dist=True)
+
+            # Gate-dependent regularization for schemes with gates.
+            if router_gate is not None:
+                gate_penalty = (router_gate * (1.0 - router_gate)).mean()
+                if self.sad_rvq_scheme in {"d", "h"} and self.sad_rvq_scheme_train_mode != "acoustic_only":
+                    total_loss = total_loss + self.sad_rvq_scheme_d_gate_polar_weight * gate_penalty
+                self.log(f"{stage}/scheme_d_gate_polar_penalty", gate_penalty, prog_bar=True, sync_dist=True)
+
+                gate_mean = router_gate.mean().detach()
+                gate_std = router_gate.std().detach()
+                self.log(f"{stage}/scheme_d_gate_mean", gate_mean, prog_bar=True, sync_dist=True)
+                self.log(f"{stage}/scheme_d_gate_std", gate_std, prog_bar=False, sync_dist=True)
+
+                gate_entropy = -(router_gate * torch.log(router_gate.clamp(min=1e-8)) + (1 - router_gate) * torch.log((1 - router_gate).clamp(min=1e-8)))
+                gate_entropy_loss = -gate_entropy.mean()
+                if self.sad_rvq_scheme in {"d", "h"} and self.sad_rvq_scheme_train_mode != "acoustic_only":
+                    total_loss = total_loss + self.sad_rvq_scheme_d_gate_entropy_weight * gate_entropy_loss
+                self.log(f"{stage}/scheme_d_gate_entropy", gate_entropy_loss, prog_bar=False, sync_dist=True)
 
 
         y_q_sum = self._sum_quantized_latent(y_q, K)
@@ -773,7 +908,12 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                     elif y_q_step.shape[1] != x_q.shape[1]: y_q_step = y_q_step.reshape(x_q.shape)
             y_q_step = y_q_step.masked_fill(mask.unsqueeze(1), 0)
             
-            log_p, residual_pred, _ = self.log_score(y_q_step, x_q, x_cont=x_cont)
+            log_p, residual_pred, _, logits_raw = self.log_score(y_q_step, x_q, x_cont=x_cont, return_raw_logits=True)
+
+            # Apply post-3-layer fusion schemes in inference sampling loop as well.
+            if self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} and self.scheme_d_acoustic_head is not None:
+                fused_logits, _, _ = self._scheme_d_fuse_logits(logits_raw, x_cont if x_cont is not None else x_q.mean(dim=2))
+                log_p = fused_logits.log_softmax(dim=-1)
             
             # 用 EMA 聚合多步连续残差，减少只取最后一步导致的细节丢失。
             if residual_pred is not None:

@@ -33,16 +33,35 @@ if __name__ == "__main__":
     parser.add_argument("--direct-residual-weight", type=float, default=1.0, help="Weight for explicit DEX residual supervision")
     parser.add_argument("--residual-l1-weight", type=float, default=0.0, help="Fallback latent residual L1 weight")
     parser.add_argument("--si-sdr-weight", type=float, default=0.2, help="Wave-domain SI-SDR weight for this run")
+    parser.add_argument("--optimizer-lr", type=float, default=6.0e-5, help="Optimizer LR override")
+    parser.add_argument("--spec-loss-weight", type=float, default=1.0, help="Spectral loss weight")
+    parser.add_argument("--wave-l1-weight", type=float, default=2.0, help="Wave L1 loss weight")
     parser.add_argument("--alpha-init-prob", type=float, default=0.05, help="Initial sigmoid probability for alpha gates")
     parser.add_argument("--print-alpha", action="store_true", help="Print alpha logs in progress bar (handled in lightning logs)")
 
     # ===== SAD-RVQ Scheme Selection =====
-    parser.add_argument("--sad-rvq-scheme", type=str, default="baseline", choices=["baseline", "a", "b", "c", "d"],
+    parser.add_argument("--sad-rvq-scheme", type=str, default="baseline", choices=["baseline", "a", "b", "c", "d", "e", "f", "g", "h"],
                        help="Which SAD-RVQ scheme to use (baseline, a=entropy, b=dual-head, c=progressive, d=gating)")
     parser.add_argument("--sad-rvq-scheme-a-weight", type=float, default=0.5,
                        help="Weight for Scheme A entropy boost loss")
     parser.add_argument("--sad-rvq-scheme-d-gate-entropy-weight", type=float, default=0.1,
                        help="Weight for Scheme D gate entropy regularization")
+    parser.add_argument("--sad-rvq-scheme-d-acoustic-weight", type=float, default=0.5,
+                       help="Weight for direct acoustic logits supervision (Scheme D)")
+    parser.add_argument("--sad-rvq-scheme-d-gate-polar-weight", type=float, default=0.1,
+                       help="Weight for gate polarization penalty (Scheme D)")
+    parser.add_argument("--sad-rvq-scheme-d-acoustic-lr-scale", type=float, default=5.0,
+                       help="Gradient scale for Scheme D acoustic branch to emulate higher LR")
+    parser.add_argument("--sad-rvq-scheme-d-final-weight", type=float, default=1.0,
+                       help="Weight for fused post-3 CE in Scheme D/H")
+    parser.add_argument("--sad-rvq-scheme-train-mode", type=str, default="normal", choices=["normal", "acoustic_only"],
+                       help="Training mode for Scheme D/H")
+    parser.add_argument("--sad-rvq-freeze-main-model", action="store_true",
+                       help="Freeze main DiT model parameters and train acoustic branch only")
+    parser.add_argument("--sad-rvq-scheme-g-entropy-quantile", type=float, default=0.5,
+                       help="Quantile threshold for entropy-guided hard routing (Scheme G)")
+    parser.add_argument("--sad-rvq-scheme-h-min-temp", type=float, default=0.1,
+                       help="Minimum temperature for annealed routing (Scheme H)")
 
     args = parser.parse_args()
 
@@ -76,11 +95,12 @@ if __name__ == "__main__":
             f"++dm.train_dataset.length={max(args.train_groups, args.train_batches * args.batch_size)}",
 
             # ==== 1.1 P-SSA 训练超参（从 Oracle 过渡到真实训练） ====
-            "++lm.spec_loss_weight=1.0",
-            "++lm.wave_l1_weight=2.0",
+            f"++lm.spec_loss_weight={args.spec_loss_weight}",
+            f"++lm.wave_l1_weight={args.wave_l1_weight}",
             f"++lm.si_sdr_weight={args.si_sdr_weight}",
             f"++lm.residual_l1_weight={args.residual_l1_weight}",
             f"++lm.direct_residual_weight={args.direct_residual_weight}",
+            f"++lm.optimizer.lr={args.optimizer_lr}",
             "++lm.metricgan_plus_enabled=false",
             "++lm.metricgan_weight=0.0",
             "++lm.wave_residual_multiscale=true",
@@ -104,6 +124,14 @@ if __name__ == "__main__":
             f"++lm.sad_rvq_scheme_d_enabled={str(args.sad_rvq_scheme == 'd').lower()}",
             f"++lm.sad_rvq_scheme_a_weight={args.sad_rvq_scheme_a_weight}",
             f"++lm.sad_rvq_scheme_d_gate_entropy_weight={args.sad_rvq_scheme_d_gate_entropy_weight}",
+            f"++lm.sad_rvq_scheme_d_acoustic_weight={args.sad_rvq_scheme_d_acoustic_weight}",
+            f"++lm.sad_rvq_scheme_d_gate_polar_weight={args.sad_rvq_scheme_d_gate_polar_weight}",
+            f"++lm.sad_rvq_scheme_d_acoustic_lr_scale={args.sad_rvq_scheme_d_acoustic_lr_scale}",
+            f"++lm.sad_rvq_scheme_d_final_weight={args.sad_rvq_scheme_d_final_weight}",
+            f"++lm.sad_rvq_scheme_train_mode={args.sad_rvq_scheme_train_mode}",
+            f"++lm.sad_rvq_freeze_main_model={str(args.sad_rvq_freeze_main_model).lower()}",
+            f"++lm.sad_rvq_scheme_g_entropy_quantile={args.sad_rvq_scheme_g_entropy_quantile}",
+            f"++lm.sad_rvq_scheme_h_min_temp={args.sad_rvq_scheme_h_min_temp}",
         ],
         overwrite=args.reset_log_dir, wandb=False
     )
@@ -122,10 +150,18 @@ if __name__ == "__main__":
                 f"lm.wave_residual_enabled={str((not args.disable_wave_residual)).lower()}",
                 f"eval.dsets.edbase-local.length={args.eval_examples}",
                 f"lm.deterministic_eval={str(args.deterministic_eval).lower()}",
-                f"lm.sad_rvq_scheme={args.sad_rvq_scheme}",
-                f"lm.sad_rvq_scheme_d_enabled={str(args.sad_rvq_scheme == 'd').lower()}",
-                f"lm.sad_rvq_scheme_a_weight={args.sad_rvq_scheme_a_weight}",
-                f"lm.sad_rvq_scheme_d_gate_entropy_weight={args.sad_rvq_scheme_d_gate_entropy_weight}",
+                f"++lm.sad_rvq_scheme={args.sad_rvq_scheme}",
+                f"++lm.sad_rvq_scheme_d_enabled={str(args.sad_rvq_scheme == 'd').lower()}",
+                f"++lm.sad_rvq_scheme_a_weight={args.sad_rvq_scheme_a_weight}",
+                f"++lm.sad_rvq_scheme_d_gate_entropy_weight={args.sad_rvq_scheme_d_gate_entropy_weight}",
+                f"++lm.sad_rvq_scheme_d_acoustic_weight={args.sad_rvq_scheme_d_acoustic_weight}",
+                f"++lm.sad_rvq_scheme_d_gate_polar_weight={args.sad_rvq_scheme_d_gate_polar_weight}",
+                f"++lm.sad_rvq_scheme_d_acoustic_lr_scale={args.sad_rvq_scheme_d_acoustic_lr_scale}",
+                f"++lm.sad_rvq_scheme_d_final_weight={args.sad_rvq_scheme_d_final_weight}",
+                f"++lm.sad_rvq_scheme_train_mode={args.sad_rvq_scheme_train_mode}",
+                f"++lm.sad_rvq_freeze_main_model={str(args.sad_rvq_freeze_main_model).lower()}",
+                f"++lm.sad_rvq_scheme_g_entropy_quantile={args.sad_rvq_scheme_g_entropy_quantile}",
+                f"++lm.sad_rvq_scheme_h_min_temp={args.sad_rvq_scheme_h_min_temp}",
             ],
             output_dir=args.output_dir,
             output_db=args.output_db,
