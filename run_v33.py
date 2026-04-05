@@ -2,6 +2,8 @@ import argparse
 import os
 import shutil
 import sys
+import random
+import numpy as np
 import torch
 from pathlib import Path
 from hydra.core.global_hydra import GlobalHydra
@@ -38,6 +40,7 @@ if __name__ == "__main__":
     parser.add_argument("--wave-l1-weight", type=float, default=2.0, help="Wave L1 loss weight")
     parser.add_argument("--alpha-init-prob", type=float, default=0.05, help="Initial sigmoid probability for alpha gates")
     parser.add_argument("--print-alpha", action="store_true", help="Print alpha logs in progress bar (handled in lightning logs)")
+    parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducible runs")
 
     # ===== SAD-RVQ Scheme Selection =====
     parser.add_argument("--sad-rvq-scheme", type=str, default="baseline", choices=["baseline", "a", "b", "c", "d", "e", "f", "g", "h"],
@@ -52,8 +55,72 @@ if __name__ == "__main__":
                        help="Weight for gate polarization penalty (Scheme D)")
     parser.add_argument("--sad-rvq-scheme-d-acoustic-lr-scale", type=float, default=5.0,
                        help="Gradient scale for Scheme D acoustic branch to emulate higher LR")
+    parser.add_argument("--sad-rvq-scheme-d-head-lr-scale", type=float, default=1.0,
+                       help="Extra gradient scale for Scheme D acoustic token head")
     parser.add_argument("--sad-rvq-scheme-d-final-weight", type=float, default=1.0,
                        help="Weight for fused post-3 CE in Scheme D/H")
+    parser.add_argument("--sad-rvq-scheme-d-reg-weight", type=float, default=1.0,
+                       help="Weight for latent regression loss in Scheme D/H")
+    parser.add_argument("--sad-rvq-scheme-d-ce-aux-weight", type=float, default=0.1,
+                       help="Auxiliary CE weight when acoustic_only mode is enabled")
+    parser.add_argument("--sad-rvq-scheme-d-codebook-consistency-weight", type=float, default=0.0,
+                       help="Weight for codebook consistency loss on regressed latent")
+    parser.add_argument("--sad-rvq-scheme-d-codebook-consistency-books", type=int, default=12,
+                       help="Number of NAC codebooks used in codebook consistency loss")
+    parser.add_argument("--sad-rvq-scheme-d-post3-head-hidden-mult", type=int, default=3,
+                       help="Hidden dimension multiplier for post-3 acoustic heads")
+    parser.add_argument("--sad-rvq-scheme-d-use-prototype-objective", action="store_true",
+                       help="Use prototype alignment + residual correction objective for post-3 acoustic branch")
+    parser.add_argument("--sad-rvq-scheme-d-prototype-weight", type=float, default=1.0,
+                       help="Weight for prototype alignment loss")
+    parser.add_argument("--sad-rvq-scheme-d-residual-correction-weight", type=float, default=0.1,
+                       help="Weight for residual correction loss")
+    parser.add_argument("--sad-rvq-scheme-d-use-candidate-objective", action="store_true",
+                       help="Use candidate-set contrastive objective for post-3 acoustic branch")
+    parser.add_argument("--sad-rvq-scheme-d-candidate-size", type=int, default=32,
+                       help="Number of candidate tokens for contrastive selection")
+    parser.add_argument("--sad-rvq-scheme-d-candidate-ce-weight", type=float, default=0.3,
+                       help="Weight for candidate-set contrastive CE loss")
+    parser.add_argument("--sad-rvq-scheme-d-candidate-query-from-front-tokens", action="store_true",
+                       help="Build candidate set using front token embeddings instead of projected latent")
+    parser.add_argument("--sad-rvq-scheme-d-use-multimodal-query", action="store_true",
+                       help="Enable multimodal query branch (baseline keeps this disabled)")
+    parser.add_argument("--sad-rvq-scheme-d-distribution-alignment-weight", type=float, default=1.0,
+                       help="Weight for projector-space distribution alignment loss")
+    parser.add_argument("--sad-rvq-scheme-d-warmup-steps", type=int, default=10000,
+                       help="Prototype-only warmup steps before enabling full post-3 objective")
+    parser.add_argument("--sad-rvq-scheme-d-distribution-only-l4", action="store_true",
+                       help="Align distribution stats using only layer-4 codebook")
+    parser.add_argument("--sad-rvq-scheme-d-log-l4-dist", action="store_true",
+                       help="Log layer-4 correct/wrong token distance means during validation")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-residual-mode", action="store_true",
+                       help="Bypass token CE objectives and train wave-domain continuous residual refinement")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-coarse-weight", type=float, default=0.3,
+                       help="Weight for coarse-wave SI-SDR loss in continuous residual mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-enhanced-weight", type=float, default=1.0,
+                       help="Weight for enhanced-wave SI-SDR loss in continuous residual mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-front3-ce-weight", type=float, default=1.0,
+                       help="Auxiliary CE weight for first 3 codebooks in continuous residual mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-coarse-source", type=str, default="front3", choices=["front3", "noisy"],
+                       help="Coarse waveform source in continuous residual mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-dump-audio", action="store_true",
+                       help="Dump coarse/noisy/clean wav triplet for val batch-0 diagnosis")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-use-stft-predictor", action="store_true",
+                       help="Use STFT-conditioned residual predictor in continuous residual mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stft-nfft", type=int, default=512,
+                       help="NFFT for STFT-conditioned residual predictor")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stft-hop", type=int, default=128,
+                       help="Hop length for STFT-conditioned residual predictor")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stft-win", type=int, default=512,
+                       help="Window length for STFT-conditioned residual predictor")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-multiscale-spec-weight", type=float, default=0.0,
+                       help="Weight for multiscale STFT magnitude loss in continuous mode")
+    parser.add_argument("--sad-rvq-scheme-d-projector-hidden-mult", type=float, default=1.5,
+                       help="Hidden multiplier for codebook projector MLP")
+    parser.add_argument("--sad-rvq-scheme-d-train-post3-only", action="store_true",
+                       help="Freeze non-post3 parameters and train only post3 prototype branch")
+    parser.add_argument("--sad-rvq-scheme-d-init-from-codebook", action="store_true",
+                       help="Initialize Scheme D acoustic token head from NAC codebook")
     parser.add_argument("--sad-rvq-scheme-train-mode", type=str, default="normal", choices=["normal", "acoustic_only"],
                        help="Training mode for Scheme D/H")
     parser.add_argument("--sad-rvq-freeze-main-model", action="store_true",
@@ -64,6 +131,14 @@ if __name__ == "__main__":
                        help="Minimum temperature for annealed routing (Scheme H)")
 
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     # ====================================================================
     # 【关键修复】必须放在 __main__ 里面！防止 Windows 多进程反复删除文件夹！
@@ -127,7 +202,39 @@ if __name__ == "__main__":
             f"++lm.sad_rvq_scheme_d_acoustic_weight={args.sad_rvq_scheme_d_acoustic_weight}",
             f"++lm.sad_rvq_scheme_d_gate_polar_weight={args.sad_rvq_scheme_d_gate_polar_weight}",
             f"++lm.sad_rvq_scheme_d_acoustic_lr_scale={args.sad_rvq_scheme_d_acoustic_lr_scale}",
+            f"++lm.sad_rvq_scheme_d_head_lr_scale={args.sad_rvq_scheme_d_head_lr_scale}",
             f"++lm.sad_rvq_scheme_d_final_weight={args.sad_rvq_scheme_d_final_weight}",
+            f"++lm.sad_rvq_scheme_d_reg_weight={args.sad_rvq_scheme_d_reg_weight}",
+            f"++lm.sad_rvq_scheme_d_ce_aux_weight={args.sad_rvq_scheme_d_ce_aux_weight}",
+            f"++lm.sad_rvq_scheme_d_codebook_consistency_weight={args.sad_rvq_scheme_d_codebook_consistency_weight}",
+            f"++lm.sad_rvq_scheme_d_codebook_consistency_books={args.sad_rvq_scheme_d_codebook_consistency_books}",
+            f"++lm.sad_rvq_scheme_d_post3_head_hidden_mult={args.sad_rvq_scheme_d_post3_head_hidden_mult}",
+            f"++lm.sad_rvq_scheme_d_use_prototype_objective={str(args.sad_rvq_scheme_d_use_prototype_objective).lower()}",
+            f"++lm.sad_rvq_scheme_d_prototype_weight={args.sad_rvq_scheme_d_prototype_weight}",
+            f"++lm.sad_rvq_scheme_d_residual_correction_weight={args.sad_rvq_scheme_d_residual_correction_weight}",
+            f"++lm.sad_rvq_scheme_d_use_candidate_objective={str(args.sad_rvq_scheme_d_use_candidate_objective).lower()}",
+            f"++lm.sad_rvq_scheme_d_candidate_size={args.sad_rvq_scheme_d_candidate_size}",
+            f"++lm.sad_rvq_scheme_d_candidate_ce_weight={args.sad_rvq_scheme_d_candidate_ce_weight}",
+            f"++lm.sad_rvq_scheme_d_candidate_query_from_front_tokens={str(args.sad_rvq_scheme_d_candidate_query_from_front_tokens).lower()}",
+            f"++lm.sad_rvq_scheme_d_use_multimodal_query={str(args.sad_rvq_scheme_d_use_multimodal_query).lower()}",
+            f"++lm.sad_rvq_scheme_d_distribution_alignment_weight={args.sad_rvq_scheme_d_distribution_alignment_weight}",
+            f"++lm.sad_rvq_scheme_d_warmup_steps={args.sad_rvq_scheme_d_warmup_steps}",
+            f"++lm.sad_rvq_scheme_d_distribution_only_l4={str(args.sad_rvq_scheme_d_distribution_only_l4).lower()}",
+            f"++lm.sad_rvq_scheme_d_log_l4_dist={str(args.sad_rvq_scheme_d_log_l4_dist).lower()}",
+            f"++lm.sad_rvq_scheme_d_continuous_residual_mode={str(args.sad_rvq_scheme_d_continuous_residual_mode).lower()}",
+            f"++lm.sad_rvq_scheme_d_continuous_coarse_weight={args.sad_rvq_scheme_d_continuous_coarse_weight}",
+            f"++lm.sad_rvq_scheme_d_continuous_enhanced_weight={args.sad_rvq_scheme_d_continuous_enhanced_weight}",
+            f"++lm.sad_rvq_scheme_d_continuous_front3_ce_weight={args.sad_rvq_scheme_d_continuous_front3_ce_weight}",
+            f"++lm.sad_rvq_scheme_d_continuous_coarse_source={args.sad_rvq_scheme_d_continuous_coarse_source}",
+            f"++lm.sad_rvq_scheme_d_continuous_dump_audio={str(args.sad_rvq_scheme_d_continuous_dump_audio).lower()}",
+            f"++lm.sad_rvq_scheme_d_continuous_use_stft_predictor={str(args.sad_rvq_scheme_d_continuous_use_stft_predictor).lower()}",
+            f"++lm.sad_rvq_scheme_d_continuous_stft_nfft={args.sad_rvq_scheme_d_continuous_stft_nfft}",
+            f"++lm.sad_rvq_scheme_d_continuous_stft_hop={args.sad_rvq_scheme_d_continuous_stft_hop}",
+            f"++lm.sad_rvq_scheme_d_continuous_stft_win={args.sad_rvq_scheme_d_continuous_stft_win}",
+            f"++lm.sad_rvq_scheme_d_continuous_multiscale_spec_weight={args.sad_rvq_scheme_d_continuous_multiscale_spec_weight}",
+            f"++lm.sad_rvq_scheme_d_projector_hidden_mult={args.sad_rvq_scheme_d_projector_hidden_mult}",
+            f"++lm.sad_rvq_scheme_d_train_post3_only={str(args.sad_rvq_scheme_d_train_post3_only).lower()}",
+            f"++lm.sad_rvq_scheme_d_init_from_codebook={str(args.sad_rvq_scheme_d_init_from_codebook).lower()}",
             f"++lm.sad_rvq_scheme_train_mode={args.sad_rvq_scheme_train_mode}",
             f"++lm.sad_rvq_freeze_main_model={str(args.sad_rvq_freeze_main_model).lower()}",
             f"++lm.sad_rvq_scheme_g_entropy_quantile={args.sad_rvq_scheme_g_entropy_quantile}",
@@ -157,7 +264,39 @@ if __name__ == "__main__":
                 f"++lm.sad_rvq_scheme_d_acoustic_weight={args.sad_rvq_scheme_d_acoustic_weight}",
                 f"++lm.sad_rvq_scheme_d_gate_polar_weight={args.sad_rvq_scheme_d_gate_polar_weight}",
                 f"++lm.sad_rvq_scheme_d_acoustic_lr_scale={args.sad_rvq_scheme_d_acoustic_lr_scale}",
+                f"++lm.sad_rvq_scheme_d_head_lr_scale={args.sad_rvq_scheme_d_head_lr_scale}",
                 f"++lm.sad_rvq_scheme_d_final_weight={args.sad_rvq_scheme_d_final_weight}",
+                f"++lm.sad_rvq_scheme_d_reg_weight={args.sad_rvq_scheme_d_reg_weight}",
+                f"++lm.sad_rvq_scheme_d_ce_aux_weight={args.sad_rvq_scheme_d_ce_aux_weight}",
+                f"++lm.sad_rvq_scheme_d_codebook_consistency_weight={args.sad_rvq_scheme_d_codebook_consistency_weight}",
+                f"++lm.sad_rvq_scheme_d_codebook_consistency_books={args.sad_rvq_scheme_d_codebook_consistency_books}",
+                f"++lm.sad_rvq_scheme_d_post3_head_hidden_mult={args.sad_rvq_scheme_d_post3_head_hidden_mult}",
+                f"++lm.sad_rvq_scheme_d_use_prototype_objective={str(args.sad_rvq_scheme_d_use_prototype_objective).lower()}",
+                f"++lm.sad_rvq_scheme_d_prototype_weight={args.sad_rvq_scheme_d_prototype_weight}",
+                f"++lm.sad_rvq_scheme_d_residual_correction_weight={args.sad_rvq_scheme_d_residual_correction_weight}",
+                f"++lm.sad_rvq_scheme_d_use_candidate_objective={str(args.sad_rvq_scheme_d_use_candidate_objective).lower()}",
+                f"++lm.sad_rvq_scheme_d_candidate_size={args.sad_rvq_scheme_d_candidate_size}",
+                f"++lm.sad_rvq_scheme_d_candidate_ce_weight={args.sad_rvq_scheme_d_candidate_ce_weight}",
+                f"++lm.sad_rvq_scheme_d_candidate_query_from_front_tokens={str(args.sad_rvq_scheme_d_candidate_query_from_front_tokens).lower()}",
+                f"++lm.sad_rvq_scheme_d_use_multimodal_query={str(args.sad_rvq_scheme_d_use_multimodal_query).lower()}",
+                f"++lm.sad_rvq_scheme_d_distribution_alignment_weight={args.sad_rvq_scheme_d_distribution_alignment_weight}",
+                f"++lm.sad_rvq_scheme_d_warmup_steps={args.sad_rvq_scheme_d_warmup_steps}",
+                f"++lm.sad_rvq_scheme_d_distribution_only_l4={str(args.sad_rvq_scheme_d_distribution_only_l4).lower()}",
+                f"++lm.sad_rvq_scheme_d_log_l4_dist={str(args.sad_rvq_scheme_d_log_l4_dist).lower()}",
+                f"++lm.sad_rvq_scheme_d_continuous_residual_mode={str(args.sad_rvq_scheme_d_continuous_residual_mode).lower()}",
+                f"++lm.sad_rvq_scheme_d_continuous_coarse_weight={args.sad_rvq_scheme_d_continuous_coarse_weight}",
+                f"++lm.sad_rvq_scheme_d_continuous_enhanced_weight={args.sad_rvq_scheme_d_continuous_enhanced_weight}",
+                f"++lm.sad_rvq_scheme_d_continuous_front3_ce_weight={args.sad_rvq_scheme_d_continuous_front3_ce_weight}",
+                f"++lm.sad_rvq_scheme_d_continuous_coarse_source={args.sad_rvq_scheme_d_continuous_coarse_source}",
+                f"++lm.sad_rvq_scheme_d_continuous_dump_audio={str(args.sad_rvq_scheme_d_continuous_dump_audio).lower()}",
+                f"++lm.sad_rvq_scheme_d_continuous_use_stft_predictor={str(args.sad_rvq_scheme_d_continuous_use_stft_predictor).lower()}",
+                f"++lm.sad_rvq_scheme_d_continuous_stft_nfft={args.sad_rvq_scheme_d_continuous_stft_nfft}",
+                f"++lm.sad_rvq_scheme_d_continuous_stft_hop={args.sad_rvq_scheme_d_continuous_stft_hop}",
+                f"++lm.sad_rvq_scheme_d_continuous_stft_win={args.sad_rvq_scheme_d_continuous_stft_win}",
+                f"++lm.sad_rvq_scheme_d_continuous_multiscale_spec_weight={args.sad_rvq_scheme_d_continuous_multiscale_spec_weight}",
+                f"++lm.sad_rvq_scheme_d_projector_hidden_mult={args.sad_rvq_scheme_d_projector_hidden_mult}",
+                f"++lm.sad_rvq_scheme_d_train_post3_only={str(args.sad_rvq_scheme_d_train_post3_only).lower()}",
+                f"++lm.sad_rvq_scheme_d_init_from_codebook={str(args.sad_rvq_scheme_d_init_from_codebook).lower()}",
                 f"++lm.sad_rvq_scheme_train_mode={args.sad_rvq_scheme_train_mode}",
                 f"++lm.sad_rvq_freeze_main_model={str(args.sad_rvq_freeze_main_model).lower()}",
                 f"++lm.sad_rvq_scheme_g_entropy_quantile={args.sad_rvq_scheme_g_entropy_quantile}",

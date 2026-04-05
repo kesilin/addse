@@ -1,0 +1,5 @@
+epoch,max_memory_allocated,max_memory_reserved,step,train_loss,training_time,val/ce_l4plus_base,val/ce_l4plus_fused,val/ce_loss,val/ce_loss_l4plus,val/loss,val/scheme_d_gate_entropy,val/scheme_d_gate_mean,val/scheme_d_gate_polar_penalty,val/scheme_d_gate_std,val/scheme_d_loss_acoustic_l4plus,val/scheme_d_loss_codebook_consistency,val/scheme_d_loss_final_l4plus,val/scheme_d_loss_reg_latent,val_loss
+0,,,29,,,5.880916595458984,5.904560089111328,4.7322235107421875,5.880916595458984,2.9922800064086914,-0.6925915479660034,0.484619140625,0.2498779296875,0.0,6.933606147766113,6.300873756408691,5.904560089111328,0.9754714369773865,2.9922800064086914
+0,,,29,2.8810973167419434,,,,,,,,,,,,,,,
+,,,0,,65.0470000000023,,,,,,,,,,,,,,
+,949181952,1180696576,1,,,,,,,,,,,,,,,,

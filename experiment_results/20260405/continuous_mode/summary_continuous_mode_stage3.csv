@@ -1,0 +1,4 @@
+exp,epochs,batches,val_cont_loss_enhanced,val_cont_res_abs_mean,val_loss,pesq,sdr,si_sdr,val_cont_ms_spec_loss
+exp8_stft_mixed_1e100b,1,100,-3.1546370983,0.0354110748,4.8032646179,1.61,-0.2,-5.99,
+exp10_stft_mixed_5e500b,5,500,-3.1558058262,0.0137869632,4.9269766808,1.72,0.25,-4.42,
+exp11_stft_ms_spec_1e100b,1,100,-3.1547276974,0.0354214385,8.0031795502,1.61,-0.2,-5.99,6.400039196

@@ -1,0 +1,4 @@
+exp,val_cont_loss_coarse,val_cont_loss_enhanced,val_cont_loss_noisy,val_cont_res_abs_mean,val_loss,pesq,sdr,si_sdr
+exp6_noisy_coarse_baseline,-3.1526236534,-3.1526250839,-3.1526236534,,4.8038287163,1.61,-0.2,-5.99
+exp8_stft_mixed_loss,-3.1526236534,-3.1546370983,-3.1526236534,0.0354110748,4.8032646179,1.61,-0.2,-5.99
+exp9_stft_enhanced_only,-3.1526236534,-3.1546356678,-3.1526236534,0.0354067311,5.7490525246,1.61,-0.2,-5.99

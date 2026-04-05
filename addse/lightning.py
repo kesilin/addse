@@ -3,6 +3,7 @@ import math
 import os
 import re
 import warnings
+import wave
 from abc import abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -103,6 +104,23 @@ class MetricDiscriminator(nn.Module):
         h = torch.cat([y_hat, y_ref], dim=1)
         h = self.net(h).squeeze(-1)
         return torch.sigmoid(self.head(h))
+
+
+class ResidualMLPHead(nn.Module):
+    def __init__(self, input_dim: int, output_dim: int, hidden_mult: int = 2) -> None:
+        super().__init__()
+        hidden_dim = max(input_dim, input_dim * hidden_mult)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.residual_proj = nn.Linear(input_dim, output_dim) if input_dim != output_dim else nn.Identity()
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = self.residual_proj(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x + residual
 
 @dataclass
 class LogConfig:
@@ -241,31 +259,148 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.sad_rvq_scheme_d_acoustic_weight = float(kwargs.get("sad_rvq_scheme_d_acoustic_weight", 0.5))
         self.sad_rvq_scheme_d_gate_polar_weight = float(kwargs.get("sad_rvq_scheme_d_gate_polar_weight", 0.1))
         self.sad_rvq_scheme_d_acoustic_lr_scale = float(kwargs.get("sad_rvq_scheme_d_acoustic_lr_scale", 1.0))
+        self.sad_rvq_scheme_d_head_lr_scale = float(kwargs.get("sad_rvq_scheme_d_head_lr_scale", 1.0))
         self.sad_rvq_scheme_g_entropy_quantile = float(kwargs.get("sad_rvq_scheme_g_entropy_quantile", 0.5))
         self.sad_rvq_scheme_h_min_temp = float(kwargs.get("sad_rvq_scheme_h_min_temp", 0.1))
         self.sad_rvq_scheme_d_final_weight = float(kwargs.get("sad_rvq_scheme_d_final_weight", 1.0))
+        self.sad_rvq_scheme_d_reg_weight = float(kwargs.get("sad_rvq_scheme_d_reg_weight", 1.0))
+        self.sad_rvq_scheme_d_ce_aux_weight = float(kwargs.get("sad_rvq_scheme_d_ce_aux_weight", 0.1))
+        self.sad_rvq_scheme_d_codebook_consistency_weight = float(kwargs.get("sad_rvq_scheme_d_codebook_consistency_weight", 0.0))
+        self.sad_rvq_scheme_d_codebook_consistency_books = int(kwargs.get("sad_rvq_scheme_d_codebook_consistency_books", 12))
+        self.sad_rvq_scheme_d_post3_head_hidden_mult = int(kwargs.get("sad_rvq_scheme_d_post3_head_hidden_mult", 3))
+        self.sad_rvq_scheme_d_use_prototype_objective = bool(kwargs.get("sad_rvq_scheme_d_use_prototype_objective", False))
+        self.sad_rvq_scheme_d_prototype_weight = float(kwargs.get("sad_rvq_scheme_d_prototype_weight", 1.0))
+        self.sad_rvq_scheme_d_residual_correction_weight = float(kwargs.get("sad_rvq_scheme_d_residual_correction_weight", 0.1))
+        self.sad_rvq_scheme_d_distribution_alignment_weight = float(kwargs.get("sad_rvq_scheme_d_distribution_alignment_weight", 1.0))
+        self.sad_rvq_scheme_d_projector_hidden_mult = float(kwargs.get("sad_rvq_scheme_d_projector_hidden_mult", 1.5))
+        self.sad_rvq_scheme_d_train_post3_only = bool(kwargs.get("sad_rvq_scheme_d_train_post3_only", False))
+        self.sad_rvq_scheme_d_use_candidate_objective = bool(kwargs.get("sad_rvq_scheme_d_use_candidate_objective", False))
+        self.sad_rvq_scheme_d_candidate_size = int(kwargs.get("sad_rvq_scheme_d_candidate_size", 32))
+        self.sad_rvq_scheme_d_candidate_ce_weight = float(kwargs.get("sad_rvq_scheme_d_candidate_ce_weight", 0.3))
+        self.sad_rvq_scheme_d_candidate_query_from_front_tokens = bool(kwargs.get("sad_rvq_scheme_d_candidate_query_from_front_tokens", False))
+        self.sad_rvq_scheme_d_use_multimodal_query = bool(kwargs.get("sad_rvq_scheme_d_use_multimodal_query", False))
+        self.sad_rvq_scheme_d_init_from_codebook = bool(kwargs.get("sad_rvq_scheme_d_init_from_codebook", True))
+        self.sad_rvq_scheme_d_warmup_steps = int(kwargs.get("sad_rvq_scheme_d_warmup_steps", 10000))
+        self.sad_rvq_scheme_d_distribution_only_l4 = bool(kwargs.get("sad_rvq_scheme_d_distribution_only_l4", True))
+        self.sad_rvq_scheme_d_log_l4_dist = bool(kwargs.get("sad_rvq_scheme_d_log_l4_dist", True))
+        self.sad_rvq_scheme_d_continuous_residual_mode = bool(kwargs.get("sad_rvq_scheme_d_continuous_residual_mode", False))
+        self.sad_rvq_scheme_d_continuous_coarse_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_coarse_weight", 0.3))
+        self.sad_rvq_scheme_d_continuous_enhanced_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_enhanced_weight", 1.0))
+        self.sad_rvq_scheme_d_continuous_front3_ce_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_front3_ce_weight", 1.0))
+        self.sad_rvq_scheme_d_continuous_coarse_source = str(kwargs.get("sad_rvq_scheme_d_continuous_coarse_source", "front3")).lower()
+        self.sad_rvq_scheme_d_continuous_dump_audio = bool(kwargs.get("sad_rvq_scheme_d_continuous_dump_audio", False))
+        self.sad_rvq_scheme_d_continuous_use_stft_predictor = bool(kwargs.get("sad_rvq_scheme_d_continuous_use_stft_predictor", False))
+        self.sad_rvq_scheme_d_continuous_stft_nfft = int(kwargs.get("sad_rvq_scheme_d_continuous_stft_nfft", 512))
+        self.sad_rvq_scheme_d_continuous_stft_hop = int(kwargs.get("sad_rvq_scheme_d_continuous_stft_hop", 128))
+        self.sad_rvq_scheme_d_continuous_stft_win = int(kwargs.get("sad_rvq_scheme_d_continuous_stft_win", 512))
+        self.sad_rvq_scheme_d_continuous_multiscale_spec_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_multiscale_spec_weight", 0.0))
+        self.sad_rvq_scheme_d_continuous_multiscale_spec_nffts = tuple(kwargs.get("sad_rvq_scheme_d_continuous_multiscale_spec_nffts", (512, 1024, 2048)))
+        self.sad_rvq_scheme_d_continuous_multiscale_spec_hops = tuple(kwargs.get("sad_rvq_scheme_d_continuous_multiscale_spec_hops", (128, 256, 512)))
+        self.continuous_stft_encoder: nn.Module | None = None
+        self.continuous_stft_residual_predictor: nn.Module | None = None
         self.sad_rvq_scheme_train_mode = str(kwargs.get("sad_rvq_scheme_train_mode", "normal")).lower()
         self.sad_rvq_freeze_main_model = bool(kwargs.get("sad_rvq_freeze_main_model", False))
+
+        if self.sad_rvq_scheme_d_continuous_use_stft_predictor:
+            self.continuous_stft_encoder = nn.Sequential(
+                nn.Conv2d(2, 32, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                nn.GELU(),
+            )
+            self.continuous_stft_residual_predictor = nn.Sequential(
+                nn.Conv1d(64, 256, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Upsample(scale_factor=4, mode="linear", align_corners=False),
+                nn.Conv1d(256, 256, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Upsample(scale_factor=80, mode="linear", align_corners=False),
+                nn.Conv1d(256, 1, kernel_size=3, padding=1),
+            )
         
         # Scheme D: Initialize learnable router
         scheme_with_acoustic = self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} or self.sad_rvq_scheme_d_enabled
         if scheme_with_acoustic:
+            num_codebooks = len(getattr(getattr(self.nac, "quantizer", None), "codebooks", []) or [])
+            num_codebooks = max(num_codebooks, 4)
+            self.scheme_d_num_codebooks = num_codebooks
+            self.scheme_d_post3_count = max(1, self.scheme_d_num_codebooks - 3)
             self.scheme_d_router = SchemeDLearnableGatingRouter(num_codebooks=8, feature_dim=256)
-            self.scheme_d_acoustic_head = nn.Sequential(
-                nn.Linear(256, 256),
+            vocab = int(getattr(self.model, "output_channels", 1024))
+            codebook_dim = self._scheme_d_get_codebook_dim(default_dim=256)
+            self.scheme_d_codebook_dim = codebook_dim
+            projector_hidden = max(codebook_dim, int(codebook_dim * self.sad_rvq_scheme_d_projector_hidden_mult))
+            self.scheme_d_codebook_projector = nn.Sequential(
+                nn.Linear(256, projector_hidden),
                 nn.GELU(),
-                nn.Linear(256, int(getattr(self.model, "output_channels", 1024))),
+                nn.Linear(projector_hidden, codebook_dim),
             )
+            self.scheme_d_query_compressor = nn.Sequential(
+                nn.Linear(codebook_dim * 3, max(32, codebook_dim * 2)),
+                nn.GELU(),
+                nn.Linear(max(32, codebook_dim * 2), codebook_dim),
+            )
+            self.scheme_d_stft = STFT(frame_length=512, hop_length=128, n_fft=512, window="hann", norm=True)
+            self.scheme_d_stft_encoder = nn.Sequential(
+                nn.Conv2d(2, 32, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(32, codebook_dim, kernel_size=3, padding=1),
+            )
+            self.scheme_d_residual_predictor_l4plus = nn.Sequential(
+                nn.Linear(codebook_dim, 64),
+                nn.GELU(),
+                nn.Linear(64, self.scheme_d_post3_count * codebook_dim),
+            )
+            self.scheme_d_acoustic_heads = nn.ModuleList()
+            for i in range(self.scheme_d_num_codebooks):
+                if i < 3:
+                    self.scheme_d_acoustic_heads.append(
+                        nn.Sequential(
+                            nn.Linear(256, 256),
+                            nn.GELU(),
+                            nn.Linear(256, vocab),
+                        )
+                    )
+                else:
+                    self.scheme_d_acoustic_heads.append(
+                        ResidualMLPHead(256, vocab, hidden_mult=self.sad_rvq_scheme_d_post3_head_hidden_mult)
+                    )
+
+            if self.sad_rvq_scheme_d_init_from_codebook:
+                self._init_scheme_d_acoustic_head_from_codebook()
 
             # Optional gradient scaling to give Scheme-D acoustic branch an effectively higher LR.
             if self.sad_rvq_scheme_d_acoustic_lr_scale > 1.0:
                 scale = self.sad_rvq_scheme_d_acoustic_lr_scale
-                for p in list(self.scheme_d_router.parameters()) + list(self.scheme_d_acoustic_head.parameters()):
+                acoustic_modules = [
+                    self.scheme_d_codebook_projector,
+                    self.scheme_d_query_compressor,
+                    self.scheme_d_stft_encoder,
+                    self.scheme_d_residual_predictor_l4plus,
+                    self.scheme_d_acoustic_heads,
+                ]
+                acoustic_params: list[nn.Parameter] = []
+                for module in acoustic_modules:
+                    acoustic_params.extend(list(module.parameters()))
+                for p in list(self.scheme_d_router.parameters()) + acoustic_params:
                     if p.requires_grad:
                         p.register_hook(lambda g, s=scale: g * s)
+            if self.sad_rvq_scheme_d_head_lr_scale > 1.0:
+                head_scale = self.sad_rvq_scheme_d_head_lr_scale
+                for head in self.scheme_d_acoustic_heads:
+                    for p in head.parameters():
+                        if p.requires_grad:
+                            p.register_hook(lambda g, s=head_scale: g * s)
         else:
             self.scheme_d_router = None
-            self.scheme_d_acoustic_head = None
+            self.scheme_d_post3_count = 0
+            self.scheme_d_codebook_dim = 0
+            self.scheme_d_codebook_projector = None
+            self.scheme_d_query_compressor = None
+            self.scheme_d_stft = None
+            self.scheme_d_stft_encoder = None
+            self.scheme_d_residual_predictor_l4plus = None
+            self.scheme_d_acoustic_heads = None
 
         if self.sad_rvq_freeze_main_model:
             for p in self.model.parameters():
@@ -327,6 +462,320 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             missing, unexpected = self.load_state_dict(state_dict, strict=False)
             print(f"--- 预加载完成 (missing={len(missing)}, unexpected={len(unexpected)}) ---")
 
+        if self.sad_rvq_scheme_d_train_post3_only:
+            self._scheme_d_apply_post3_train_only()
+
+    def _init_scheme_d_acoustic_head_from_codebook(self) -> None:
+        if self.scheme_d_acoustic_heads is None:
+            return
+        try:
+            codebooks = self.nac.quantizer.codebooks
+        except Exception:
+            return
+
+        cb_tensors: list[Tensor] = []
+        for cb in codebooks:
+            w = getattr(getattr(cb, "codebook", None), "weight", None)
+            if isinstance(w, Tensor) and w.ndim == 2:
+                cb_tensors.append(w.detach())
+        if len(cb_tensors) == 0:
+            return
+        with torch.no_grad():
+            for i, head in enumerate(self.scheme_d_acoustic_heads):
+                final_layer = head.fc2 if isinstance(head, ResidualMLPHead) else head[-1]
+                if not isinstance(final_layer, nn.Linear):
+                    continue
+                cb = cb_tensors[min(i, len(cb_tensors) - 1)]
+                if cb.shape[0] != final_layer.weight.shape[0]:
+                    continue
+                d = min(cb.shape[1], final_layer.weight.shape[1])
+                final_layer.weight.zero_()
+                final_layer.weight[:, :d].copy_(cb[:, :d])
+                if final_layer.bias is not None:
+                    final_layer.bias.zero_()
+
+    def _scheme_d_get_codebook_dim(self, default_dim: int = 256) -> int:
+        try:
+            codebooks = self.nac.quantizer.codebooks
+            w = getattr(getattr(codebooks[0], "codebook", None), "weight", None)
+            if isinstance(w, Tensor) and w.ndim == 2:
+                return int(w.shape[1])
+        except Exception:
+            pass
+        return int(default_dim)
+
+    def _scheme_d_prepare_acoustic_feat(self, x_lat: Tensor, L: int, feat_dim: int = 256) -> Tensor:
+        acoustic_feat = F.interpolate(x_lat, size=L, mode="nearest").transpose(1, 2)  # [B, L, C]
+        if acoustic_feat.shape[-1] < feat_dim:
+            acoustic_feat = F.pad(acoustic_feat, (0, feat_dim - acoustic_feat.shape[-1]))
+        elif acoustic_feat.shape[-1] > feat_dim:
+            acoustic_feat = acoustic_feat[..., :feat_dim]
+        return acoustic_feat
+
+    def _scheme_d_get_post3_codebooks(self, k_4plus: int) -> Tensor | None:
+        try:
+            codebooks = self.nac.quantizer.codebooks
+        except Exception:
+            return None
+        selected: list[Tensor] = []
+        for i in range(k_4plus):
+            cb_idx = min(3 + i, len(codebooks) - 1)
+            w = getattr(getattr(codebooks[cb_idx], "codebook", None), "weight", None)
+            if isinstance(w, Tensor) and w.ndim == 2:
+                selected.append(w)
+        if len(selected) == 0:
+            return None
+        return torch.stack(selected, dim=0)  # [K4, V, D]
+
+    def _scheme_d_build_multimodal_query(
+        self,
+        acoustic_source_lat: Tensor,
+        x_wave: Tensor | None,
+        x_tok_front: Tensor | None,
+        use_front_tokens: bool,
+        L: int,
+    ) -> Tensor:
+        acoustic_feat = self._scheme_d_prepare_acoustic_feat(acoustic_source_lat, L)
+        z_projected = self.scheme_d_codebook_projector(acoustic_feat) if self.scheme_d_codebook_projector is not None else acoustic_feat
+        # Clean projection-only baseline:
+        # - front-token query branch is disabled to avoid leakage/interference.
+        # - STFT branch is disabled to avoid additional alignment noise.
+        # Keep this function as the single query entry point for future ablations.
+        # if self.sad_rvq_scheme_d_use_multimodal_query:
+        #     ... token/STFT fusion ablations are intentionally disabled in baseline.
+        return z_projected
+
+    def _scheme_d_l4_distance_stats(self, acoustic_source_lat: Tensor, y_tok_l4plus: Tensor) -> tuple[Tensor, Tensor]:
+        B, K4, L = y_tok_l4plus.shape
+        acoustic_feat = self._scheme_d_prepare_acoustic_feat(acoustic_source_lat, L)
+        if self.scheme_d_codebook_projector is None or self.scheme_d_residual_predictor_l4plus is None:
+            zero = acoustic_feat.new_zeros(())
+            return zero, zero
+
+        z_projected = self.scheme_d_codebook_projector(acoustic_feat)
+        D = z_projected.shape[-1]
+        residual = self.scheme_d_residual_predictor_l4plus(z_projected).view(B, L, self.scheme_d_post3_count, D)
+
+        max_l = 64
+        if L > max_l:
+            idx = torch.linspace(0, L - 1, steps=max_l, device=acoustic_source_lat.device).long()
+            z_projected = z_projected[:, idx, :]
+            residual = residual[:, idx, :, :]
+            y_tok_l4plus = y_tok_l4plus[:, :, idx]
+            L_eff = max_l
+        else:
+            L_eff = L
+
+        codebooks = self._scheme_d_get_post3_codebooks(K4)
+        if codebooks is None or codebooks.shape[0] == 0:
+            zero = z_projected.new_zeros(())
+            return zero, zero
+
+        cb = codebooks[0]
+        d = min(D, cb.shape[-1])
+        query = z_projected[:, :, :d] + residual[:, :, 0, :d]
+        dist = torch.cdist(query.reshape(-1, d), cb[:, :d]).view(B, L_eff, cb.shape[0])
+
+        gt_tokens = y_tok_l4plus[:, 0, :].reshape(B, L_eff)
+        correct_dist = dist.gather(dim=-1, index=gt_tokens.unsqueeze(-1)).squeeze(-1)
+        if cb.shape[0] > 1:
+            wrong_dist = (dist.sum(dim=-1) - correct_dist) / (cb.shape[0] - 1)
+        else:
+            wrong_dist = correct_dist.new_zeros(correct_dist.shape)
+        return correct_dist.mean(), wrong_dist.mean()
+
+    def _scheme_d_apply_post3_train_only(self) -> None:
+        for p in self.parameters():
+            p.requires_grad = False
+
+        if self.scheme_d_codebook_projector is not None:
+            for p in self.scheme_d_codebook_projector.parameters():
+                p.requires_grad = True
+        if self.scheme_d_residual_predictor_l4plus is not None:
+            for p in self.scheme_d_residual_predictor_l4plus.parameters():
+                p.requires_grad = True
+        if self.scheme_d_acoustic_heads is not None:
+            for i, head in enumerate(self.scheme_d_acoustic_heads):
+                if i >= 3:
+                    for p in head.parameters():
+                        p.requires_grad = True
+
+    def _scheme_d_prototype_losses(self, acoustic_source_lat: Tensor, y_tok_l4plus: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        # y_tok_l4plus: [B, K4, L]
+        B, K4, L = y_tok_l4plus.shape
+        acoustic_feat = self._scheme_d_prepare_acoustic_feat(acoustic_source_lat, L)
+
+        if self.scheme_d_codebook_projector is None or self.scheme_d_residual_predictor_l4plus is None:
+            zero = acoustic_feat.new_zeros(())
+            return zero, zero, zero, acoustic_feat.new_zeros((K4,))
+
+        z_projected = self.scheme_d_codebook_projector(acoustic_feat)  # [B, L, D]
+        base_lat = z_projected
+        D = base_lat.shape[-1]
+        residual = self.scheme_d_residual_predictor_l4plus(z_projected).view(B, L, self.scheme_d_post3_count, D)
+
+        # Keep compute stable by limiting time positions used in prototype objective.
+        max_l = 64
+        if L > max_l:
+            idx = torch.linspace(0, L - 1, steps=max_l, device=acoustic_source_lat.device).long()
+            base_lat = base_lat[:, idx, :]
+            residual = residual[:, idx, :, :]
+            y_tok_l4plus = y_tok_l4plus[:, :, idx]
+            L_eff = max_l
+        else:
+            L_eff = L
+
+        codebooks = self._scheme_d_get_post3_codebooks(K4)
+        if codebooks is None:
+            zero = base_lat.new_zeros(())
+            return zero, zero, zero, base_lat.new_zeros((K4,))
+
+        # Distribution alignment in projector space.
+        z_mean = base_lat.mean(dim=(0, 1))
+        z_std = base_lat.std(dim=(0, 1)).clamp_min(1e-6)
+        cb_for_dist = codebooks[:1] if self.sad_rvq_scheme_d_distribution_only_l4 else codebooks
+        cb_mean = cb_for_dist.mean(dim=(0, 1))
+        cb_std = cb_for_dist.std(dim=(0, 1)).clamp_min(1e-6)
+        d_dist = min(z_mean.shape[-1], cb_mean.shape[-1])
+        distribution_alignment = F.l1_loss(z_mean[:d_dist], cb_mean[:d_dist]) + F.l1_loss(z_std[:d_dist], cb_std[:d_dist])
+
+        prototype_alignment = base_lat.new_zeros(())
+        residual_correction = base_lat.new_zeros(())
+        top1_accs: list[Tensor] = []
+        for k in range(K4):
+            cb = codebooks[k]  # [V, Dcb]
+            d = min(D, cb.shape[-1])
+            base_k = base_lat[:, :, :d]
+            res_k = residual[:, :, min(k, residual.shape[2] - 1), :d]
+            pred_k = base_k + res_k  # [B, L_eff, d]
+
+            dist = torch.cdist(pred_k.reshape(-1, d), cb[:, :d])
+            prototype_alignment = prototype_alignment + dist.min(dim=-1).values.mean()
+            pred_tok = dist.argmin(dim=-1)
+
+            gt_token_k = y_tok_l4plus[:, k, :].reshape(-1)
+            gt_proto = cb.index_select(0, gt_token_k)[:, :d].reshape(B, L_eff, d)
+            residual_correction = residual_correction + F.l1_loss(pred_k, gt_proto)
+            top1_accs.append((pred_tok == gt_token_k).float().mean())
+
+        prototype_alignment = prototype_alignment / K4
+        residual_correction = residual_correction / K4
+        top1_acc = torch.stack(top1_accs, dim=0)
+        return distribution_alignment, prototype_alignment, residual_correction, top1_acc
+
+    def _scheme_d_candidate_losses(
+        self,
+        acoustic_source_lat: Tensor,
+        y_tok_l4plus: Tensor,
+        x_wave: Tensor | None = None,
+        x_tok_front: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        # y_tok_l4plus: [B, K4, L]
+        B, K4, L = y_tok_l4plus.shape
+        acoustic_feat = self._scheme_d_prepare_acoustic_feat(acoustic_source_lat, L)
+
+        if self.scheme_d_codebook_projector is None or self.scheme_d_residual_predictor_l4plus is None:
+            zero = acoustic_feat.new_zeros(())
+            return zero, zero, zero, zero, acoustic_feat.new_zeros((K4,))
+
+        z_projected = self.scheme_d_codebook_projector(acoustic_feat)  # [B, L, D]
+        D = z_projected.shape[-1]
+        residual = self.scheme_d_residual_predictor_l4plus(z_projected).view(B, L, self.scheme_d_post3_count, D)
+
+        max_l = 64
+        if L > max_l:
+            idx = torch.linspace(0, L - 1, steps=max_l, device=acoustic_source_lat.device).long()
+            z_projected = z_projected[:, idx, :]
+            residual = residual[:, idx, :, :]
+            y_tok_l4plus = y_tok_l4plus[:, :, idx]
+            L_eff = max_l
+        else:
+            L_eff = L
+
+        codebooks = self._scheme_d_get_post3_codebooks(K4)
+        if codebooks is None:
+            zero = z_projected.new_zeros(())
+            return zero, zero, zero, zero, z_projected.new_zeros((K4,))
+
+        query_source = self._scheme_d_build_multimodal_query(
+            acoustic_source_lat,
+            x_wave,
+            x_tok_front,
+            self.sad_rvq_scheme_d_candidate_query_from_front_tokens,
+            L,
+        )
+
+        z_mean = z_projected.mean(dim=(0, 1))
+        z_std = z_projected.std(dim=(0, 1)).clamp_min(1e-6)
+        cb_for_dist = codebooks[:1] if self.sad_rvq_scheme_d_distribution_only_l4 else codebooks
+        cb_mean = cb_for_dist.mean(dim=(0, 1))
+        cb_std = cb_for_dist.std(dim=(0, 1)).clamp_min(1e-6)
+        d_dist = min(z_mean.shape[-1], cb_mean.shape[-1])
+        distribution_alignment = F.l1_loss(z_mean[:d_dist], cb_mean[:d_dist]) + F.l1_loss(z_std[:d_dist], cb_std[:d_dist])
+
+        candidate_ce = z_projected.new_zeros(())
+        residual_correction = z_projected.new_zeros(())
+        candidate_recall = z_projected.new_zeros(())
+        candidate_top1 = []
+
+        acoustic_logits_4plus = self._build_scheme_d_acoustic_logits(acoustic_source_lat, K4, L_eff)
+        for k in range(K4):
+            cb = codebooks[k]  # [V, Dcb]
+            d = min(D, cb.shape[-1])
+            query_k = query_source[:, :, :d] + residual[:, :, min(k, residual.shape[2] - 1), :d]
+            dist = torch.cdist(query_k.reshape(-1, d), cb[:, :d])
+            candidate_size = min(max(2, self.sad_rvq_scheme_d_candidate_size), cb.shape[0])
+            candidate_indices = dist.topk(candidate_size, dim=-1, largest=False).indices.view(B, L_eff, candidate_size)
+
+            gt_tokens = y_tok_l4plus[:, k, :].reshape(B, L_eff)
+            candidate_recall = candidate_recall + (candidate_indices == gt_tokens.unsqueeze(-1)).any(dim=-1).float().mean()
+
+            # prepend ground-truth token so the target class is always present.
+            candidate_indices = torch.cat([gt_tokens.unsqueeze(-1), candidate_indices], dim=-1)
+            cand_logits = acoustic_logits_4plus[:, k, :, :].gather(-1, candidate_indices)
+            target = torch.zeros((B, L_eff), device=acoustic_source_lat.device, dtype=torch.long)
+            candidate_ce = candidate_ce + F.cross_entropy(cand_logits.reshape(-1, candidate_indices.shape[-1]), target.reshape(-1))
+
+            gt_proto = cb.index_select(0, gt_tokens.reshape(-1))[:, :d].reshape(B, L_eff, d)
+            residual_correction = residual_correction + F.l1_loss(query_k, gt_proto)
+            candidate_top1.append((cand_logits.argmax(dim=-1) == 0).float().mean())
+
+        candidate_ce = candidate_ce / K4
+        residual_correction = residual_correction / K4
+        candidate_recall = candidate_recall / K4
+        candidate_top1_acc = torch.stack(candidate_top1, dim=0)
+        return distribution_alignment, candidate_ce, residual_correction, candidate_recall, candidate_top1_acc
+
+    def _scheme_d_codebook_consistency_loss(self, latent_pred: Tensor) -> Tensor:
+        # latent_pred: [B, C, L]
+        codebooks = getattr(getattr(self.nac, "quantizer", None), "codebooks", None)
+        if codebooks is None:
+            return latent_pred.new_zeros(())
+
+        cb_tensors: list[Tensor] = []
+        for cb in codebooks:
+            w = getattr(getattr(cb, "codebook", None), "weight", None)
+            if isinstance(w, Tensor) and w.ndim == 2:
+                cb_tensors.append(w)
+        if len(cb_tensors) == 0:
+            return latent_pred.new_zeros(())
+
+        max_books = max(1, int(self.sad_rvq_scheme_d_codebook_consistency_books))
+        cb_tensors = cb_tensors[:max_books]
+
+        z = latent_pred.transpose(1, 2)  # [B, L, C]
+        if z.shape[1] > 64:
+            step = max(1, z.shape[1] // 64)
+            z = z[:, ::step, :]
+        z_flat = z.reshape(-1, z.shape[-1])
+
+        loss = latent_pred.new_zeros(())
+        for w in cb_tensors:
+            d = min(z_flat.shape[-1], w.shape[-1])
+            dist = torch.cdist(z_flat[:, :d], w[:, :d])
+            loss = loss + dist.min(dim=1).values.mean()
+        return loss / len(cb_tensors)
+
     @staticmethod
     def _limit_residual_energy(base_lat: Tensor, residual: Tensor, max_ratio: float, eps: float = 1e-8) -> tuple[Tensor, Tensor]:
         """Clamp residual RMS relative to base latent RMS to avoid decoder phase collapse."""
@@ -354,6 +803,51 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         if target_length is not None:
             wave = wave[..., :target_length]
         return wave
+
+    def _save_debug_wave_triplet(
+        self,
+        stage: str,
+        coarse_wave: Tensor,
+        noisy_wave: Tensor,
+        clean_wave: Tensor,
+        sample_rate: int = 16000,
+    ) -> None:
+        if stage != "val" or not self.sad_rvq_scheme_d_continuous_dump_audio:
+            return
+        trainer_obj = getattr(self, "trainer", None)
+        if trainer_obj is not None and bool(getattr(trainer_obj, "sanity_checking", False)):
+            return
+        if coarse_wave.numel() == 0 or noisy_wave.numel() == 0 or clean_wave.numel() == 0:
+            return
+
+        logger_obj = getattr(self, "logger", None)
+        log_dir = getattr(logger_obj, "log_dir", None) if logger_obj is not None else None
+        if not isinstance(log_dir, str) or len(log_dir) == 0:
+            log_dir = os.path.join("logs", "addse-s-edbase-parallel60-a008-p02-spec")
+        dump_dir = os.path.join(log_dir, "continuous_debug")
+        os.makedirs(dump_dir, exist_ok=True)
+
+        epoch = int(getattr(self, "current_epoch", 0))
+
+        def _to_mono_np(x: Tensor) -> np.ndarray:
+            t = x[0].detach().float().cpu()
+            if t.ndim == 2:
+                t = t[0]
+            a = t.numpy()
+            a = np.clip(a, -1.0, 1.0)
+            return a
+
+        def _write_pcm16(path: str, data: np.ndarray) -> None:
+            pcm = (data * 32767.0).astype(np.int16)
+            with wave.open(path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(pcm.tobytes())
+
+        _write_pcm16(os.path.join(dump_dir, f"epoch{epoch:03d}_coarse.wav"), _to_mono_np(coarse_wave))
+        _write_pcm16(os.path.join(dump_dir, f"epoch{epoch:03d}_noisy.wav"), _to_mono_np(noisy_wave))
+        _write_pcm16(os.path.join(dump_dir, f"epoch{epoch:03d}_clean.wav"), _to_mono_np(clean_wave))
 
     def _predict_wave_residual(
         self,
@@ -453,34 +947,35 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             return log_p, None, None
 
     def _build_scheme_d_acoustic_logits(self, x_lat: Tensor, k_4plus: int, L: int) -> Tensor:
-        feat_dim = 256
-        acoustic_feat = F.interpolate(x_lat, size=L, mode="nearest").transpose(1, 2)  # [B, L, C]
-        if acoustic_feat.shape[-1] < feat_dim:
-            acoustic_feat = F.pad(acoustic_feat, (0, feat_dim - acoustic_feat.shape[-1]))
-        elif acoustic_feat.shape[-1] > feat_dim:
-            acoustic_feat = acoustic_feat[..., :feat_dim]
-        acoustic_logits = self.scheme_d_acoustic_head(acoustic_feat)  # [B, L, V]
-        return acoustic_logits.unsqueeze(1).expand(-1, k_4plus, -1, -1)  # [B, K4, L, V]
+        if self.scheme_d_acoustic_heads is None:
+            raise RuntimeError("Scheme-D acoustic heads are not initialized")
+        acoustic_feat = self._scheme_d_prepare_acoustic_feat(x_lat, L, feat_dim=256)
+        logits_by_codebook: list[Tensor] = []
+        for k in range(k_4plus):
+            # Post-3 layers correspond to codebook index 3 onwards.
+            head_idx = min(3 + k, len(self.scheme_d_acoustic_heads) - 1)
+            logits_by_codebook.append(self.scheme_d_acoustic_heads[head_idx](acoustic_feat))  # [B, L, V]
+        return torch.stack(logits_by_codebook, dim=1)  # [B, K4, L, V]
 
     def _scheme_d_fuse_logits(
         self,
         base_logits: Tensor,
-        x_lat: Tensor,
+        acoustic_source_lat: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         # base_logits: [B, K, L, V]
         B, K, L, _ = base_logits.shape
-        if K <= 3 or self.scheme_d_router is None or self.scheme_d_acoustic_head is None:
+        if K <= 3 or self.scheme_d_router is None or self.scheme_d_acoustic_heads is None:
             return base_logits, None, None
 
         # Router gate for all codebooks, use only post-3 layers for enhancement
         feat_dim = 256
-        acoustic_feat = F.interpolate(x_lat, size=L, mode="nearest").transpose(1, 2)
+        acoustic_feat = F.interpolate(acoustic_source_lat, size=L, mode="nearest").transpose(1, 2)
         if acoustic_feat.shape[-1] < feat_dim:
             acoustic_feat = F.pad(acoustic_feat, (0, feat_dim - acoustic_feat.shape[-1]))
         elif acoustic_feat.shape[-1] > feat_dim:
             acoustic_feat = acoustic_feat[..., :feat_dim]
         acoustic_feat_expanded = acoustic_feat.unsqueeze(1).expand(-1, K, -1, -1)
-        acoustic_logits_4plus = self._build_scheme_d_acoustic_logits(x_lat, K - 3, L)
+        acoustic_logits_4plus = self._build_scheme_d_acoustic_logits(acoustic_source_lat, K - 3, L)
         fused_logits = base_logits.clone()
 
         scheme = self.sad_rvq_scheme
@@ -539,6 +1034,35 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         si_sdr = 10.0 * torch.log10(ratio + eps)
         return -si_sdr.mean()
 
+    def _multiscale_spec_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        pred_mono = pred.squeeze(1)
+        target_mono = target.squeeze(1)
+        total = torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        n = min(len(self.sad_rvq_scheme_d_continuous_multiscale_spec_nffts), len(self.sad_rvq_scheme_d_continuous_multiscale_spec_hops))
+        for i in range(n):
+            n_fft = int(self.sad_rvq_scheme_d_continuous_multiscale_spec_nffts[i])
+            hop = int(self.sad_rvq_scheme_d_continuous_multiscale_spec_hops[i])
+            win = n_fft
+            window = torch.hann_window(win, device=pred.device, dtype=pred.dtype)
+            stft_pred = torch.stft(
+                pred_mono,
+                n_fft=n_fft,
+                hop_length=hop,
+                win_length=win,
+                window=window,
+                return_complex=True,
+            )
+            stft_target = torch.stft(
+                target_mono,
+                n_fft=n_fft,
+                hop_length=hop,
+                win_length=win,
+                window=window,
+                return_complex=True,
+            )
+            total = total + F.l1_loss(stft_pred.abs(), stft_target.abs())
+        return total / max(1, n)
+
     def _pesq_target(self, pred: Tensor, target: Tensor, max_items: int = 1) -> Tensor:
         if pesq is None:
             return torch.full((min(pred.shape[0], max_items), 1), 0.5, device=pred.device, dtype=pred.dtype)
@@ -577,6 +1101,130 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         # 核心前向传播
         log_p, residual_pred, quality_pred, logits_raw = self.log_score(y_lambda_q, x_q, x_cont=x_lat, return_raw_logits=True)
         logits_for_ce = logits_raw
+
+        if self.sad_rvq_scheme_d_continuous_residual_mode:
+            if not self.wave_residual_enabled and not self.sad_rvq_scheme_d_continuous_use_stft_predictor:
+                raise RuntimeError("Continuous residual mode requires wave_residual_enabled=true or continuous_use_stft_predictor=true")
+
+            V = logits_for_ce.shape[-1]
+            front_books = min(3, K)
+            coarse_source = self.sad_rvq_scheme_d_continuous_coarse_source
+            if coarse_source == "noisy":
+                coarse_wave = x[..., : y.shape[-1]]
+            else:
+                coarse_tok = torch.zeros_like(y_tok)
+                coarse_tok[:, :front_books, :] = logits_raw[:, :front_books, :, :].argmax(dim=-1)
+                coarse_lat = self.nac.quantizer.decode(coarse_tok, output_no_sum=False, domain="code")
+                if coarse_lat.ndim == 4:
+                    if coarse_lat.shape[1] == K:
+                        coarse_lat = coarse_lat.sum(dim=1)
+                    elif coarse_lat.shape[2] == K:
+                        coarse_lat = coarse_lat.sum(dim=2)
+                coarse_wave = self._decode_latent_to_wave(coarse_lat.detach(), target_length=y.shape[-1])
+
+            if self.sad_rvq_scheme_d_continuous_use_stft_predictor:
+                if self.continuous_stft_encoder is None or self.continuous_stft_residual_predictor is None:
+                    raise RuntimeError("continuous STFT predictor is not initialized")
+                noisy_mono = x[..., : y.shape[-1]].squeeze(1)
+                stft_window = torch.hann_window(
+                    self.sad_rvq_scheme_d_continuous_stft_win,
+                    device=noisy_mono.device,
+                    dtype=noisy_mono.dtype,
+                )
+                noisy_stft = torch.stft(
+                    noisy_mono,
+                    n_fft=self.sad_rvq_scheme_d_continuous_stft_nfft,
+                    hop_length=self.sad_rvq_scheme_d_continuous_stft_hop,
+                    win_length=self.sad_rvq_scheme_d_continuous_stft_win,
+                    window=stft_window,
+                    return_complex=True,
+                )
+                noisy_stft_ri = torch.stack([noisy_stft.real, noisy_stft.imag], dim=1)
+                stft_feat = self.continuous_stft_encoder(noisy_stft_ri).mean(dim=2)
+                wave_delta = self.continuous_stft_residual_predictor(stft_feat)
+                wave_delta = F.interpolate(wave_delta, size=coarse_wave.shape[-1], mode="linear", align_corners=False)
+                enhanced_wave = coarse_wave + wave_delta
+            else:
+                enhanced_wave, wave_delta = self._predict_wave_residual(x, coarse_wave, None)
+
+            min_len = min(coarse_wave.shape[-1], enhanced_wave.shape[-1], y.shape[-1])
+            coarse_wave = coarse_wave[..., :min_len]
+            enhanced_wave = enhanced_wave[..., :min_len]
+            y_target = y[..., :min_len]
+
+            loss_coarse = self._si_sdr_loss(coarse_wave, y_target)
+            loss_enhanced = self._si_sdr_loss(enhanced_wave, y_target)
+            noisy_si_sdr_loss = self._si_sdr_loss(x[..., :min_len], y_target)
+            total_loss = (
+                self.sad_rvq_scheme_d_continuous_coarse_weight * loss_coarse
+                + self.sad_rvq_scheme_d_continuous_enhanced_weight * loss_enhanced
+            )
+
+            if self.sad_rvq_scheme_d_continuous_front3_ce_weight > 0 and front_books > 0:
+                mask_front = mask[:, :front_books, :]
+                front_ce = F.cross_entropy(
+                    logits_for_ce[:, :front_books, :, :].reshape(-1, V),
+                    y_tok[:, :front_books, :].reshape(-1),
+                    reduction="none",
+                ).reshape(B, front_books, L)
+                front_ce = (front_ce * mask_front).sum() / (mask_front.sum() + 1e-8)
+                total_loss = total_loss + self.sad_rvq_scheme_d_continuous_front3_ce_weight * front_ce
+                self.log(f"{stage}/cont_front3_ce", front_ce, prog_bar=True, sync_dist=True)
+
+            self.log(f"{stage}/cont_loss_coarse", loss_coarse, prog_bar=True, sync_dist=True)
+            self.log(f"{stage}/cont_loss_enhanced", loss_enhanced, prog_bar=True, sync_dist=True)
+            self.log(f"{stage}/cont_loss_noisy", noisy_si_sdr_loss, prog_bar=True, sync_dist=True)
+
+            if wave_delta is not None:
+                wave_delta = wave_delta[..., :min_len]
+                wave_residual_target = (y_target - coarse_wave).detach()
+                self.log(f"{stage}/cont_res_abs_mean", wave_delta.abs().mean(), prog_bar=True, sync_dist=True)
+
+                if self.residual_l1_weight > 0:
+                    res_loss = F.l1_loss(wave_delta, wave_residual_target)
+                    total_loss = total_loss + self.residual_l1_weight * res_loss
+                    self.log(f"{stage}/cont_res_l1", res_loss, prog_bar=False, sync_dist=True)
+
+                if self.residual_cos_weight > 0:
+                    res_cos = 1.0 - F.cosine_similarity(
+                        wave_delta.flatten(1), wave_residual_target.flatten(1), dim=1
+                    ).mean()
+                    total_loss = total_loss + self.residual_cos_weight * res_cos
+                    self.log(f"{stage}/cont_res_cos", res_cos, prog_bar=False, sync_dist=True)
+
+            if self.wave_l1_weight > 0:
+                wave_l1 = F.l1_loss(enhanced_wave, y_target)
+                total_loss = total_loss + self.wave_l1_weight * wave_l1
+                self.log(f"{stage}/cont_wave_l1", wave_l1, prog_bar=False, sync_dist=True)
+
+            if self.spec_loss is not None and self.spec_loss_weight > 0:
+                spec_losses = self.spec_loss(enhanced_wave, y_target)
+                spec_main = spec_losses["loss"]
+                total_loss = total_loss + self.spec_loss_weight * spec_main
+                self.log(f"{stage}/cont_spec_loss", spec_main, prog_bar=True, sync_dist=True)
+
+            if self.sad_rvq_scheme_d_continuous_multiscale_spec_weight > 0:
+                ms_spec = self._multiscale_spec_loss(enhanced_wave, y_target)
+                total_loss = total_loss + self.sad_rvq_scheme_d_continuous_multiscale_spec_weight * ms_spec
+                self.log(f"{stage}/cont_ms_spec_loss", ms_spec, prog_bar=True, sync_dist=True)
+
+            if stage == "val" and batch_idx == 0:
+                self._save_debug_wave_triplet(stage, coarse_wave, x[..., :min_len], y_target)
+
+            self.log(f"{stage}/loss", total_loss, prog_bar=False, sync_dist=True)
+
+            if metrics or (stage == "val" and batch_idx == 0):
+                solve_out = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat, x_wave=x)
+                if self.wave_residual_enabled:
+                    y_hat = solve_out
+                else:
+                    y_lat_fused = solve_out
+                    y_hat = self._decode_latent_to_wave(y_lat_fused, target_length=y.shape[-1])
+
+                y_hat = y_hat[..., :y.shape[-1]]
+                return {"loss": total_loss}, compute_metrics(y_hat, y, metrics), {"output": y_hat, "input": x, "clean": y}
+
+            return {"loss": total_loss}, {}, {}
         
         # 1. 离散 CE Loss (猜词)
         V = logits_for_ce.shape[-1]
@@ -603,8 +1251,9 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                     self.log(f"{stage}/scheme_a_entropy_boost", entropy_boost_loss, prog_bar=True, sync_dist=True)
         
         # SAD-RVQ Scheme D/E/F/G/H: post-3-layer fusion family
-        if self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} and self.scheme_d_acoustic_head is not None and K > 3:
-            fused_logits, acoustic_logits_4plus, router_gate = self._scheme_d_fuse_logits(logits_raw, x_lat)
+        if self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} and self.scheme_d_acoustic_heads is not None and K > 3:
+            acoustic_source_lat = residual_pred if residual_pred is not None else x_lat
+            fused_logits, acoustic_logits_4plus, router_gate = self._scheme_d_fuse_logits(logits_raw, acoustic_source_lat)
 
             mask_4plus = mask[:, 3:, :]
             loss_final_4plus = F.cross_entropy(
@@ -627,13 +1276,117 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 ).reshape(B, K - 3, L)
                 loss_acoustic_4plus = (loss_acoustic_4plus * mask_4plus).sum() / (mask_4plus.sum() + 1e-8)
 
+                loss_reg_latent = torch.tensor(0.0, device=loss_acoustic_4plus.device, dtype=loss_acoustic_4plus.dtype)
+                loss_codebook_consistency = torch.tensor(0.0, device=loss_acoustic_4plus.device, dtype=loss_acoustic_4plus.dtype)
+                loss_distribution_alignment = torch.tensor(0.0, device=loss_acoustic_4plus.device, dtype=loss_acoustic_4plus.dtype)
+                loss_prototype_alignment = torch.tensor(0.0, device=loss_acoustic_4plus.device, dtype=loss_acoustic_4plus.dtype)
+                loss_residual_correction = torch.tensor(0.0, device=loss_acoustic_4plus.device, dtype=loss_acoustic_4plus.dtype)
+                loss_candidate_ce = torch.tensor(0.0, device=loss_acoustic_4plus.device, dtype=loss_acoustic_4plus.dtype)
+                candidate_recall = torch.tensor(0.0, device=loss_acoustic_4plus.device, dtype=loss_acoustic_4plus.dtype)
+                if residual_pred is not None:
+                    y_lat_clean_gt = F.interpolate(y_lat_clean, size=residual_pred.shape[-1], mode="nearest")
+                    loss_reg_latent = F.l1_loss(residual_pred, y_lat_clean_gt)
+                    self.log(f"{stage}/scheme_d_loss_reg_latent", loss_reg_latent, prog_bar=True, sync_dist=True)
+                    if self.sad_rvq_scheme_d_codebook_consistency_weight > 0:
+                        loss_codebook_consistency = self._scheme_d_codebook_consistency_loss(residual_pred)
+                        self.log(f"{stage}/scheme_d_loss_codebook_consistency", loss_codebook_consistency, prog_bar=True, sync_dist=True)
+                    if self.sad_rvq_scheme_d_use_candidate_objective:
+                        loss_distribution_alignment, loss_candidate_ce, loss_residual_correction, candidate_recall, candidate_top1 = self._scheme_d_candidate_losses(
+                            residual_pred,
+                            y_tok[:, 3:, :],
+                            x_wave=x,
+                            x_tok_front=x_tok[:, :3, :],
+                        )
+                        self.log(f"{stage}/scheme_d_loss_distribution_alignment", loss_distribution_alignment, prog_bar=True, sync_dist=True)
+                        self.log(f"{stage}/scheme_d_loss_candidate_ce", loss_candidate_ce, prog_bar=True, sync_dist=True)
+                        self.log(f"{stage}/scheme_d_loss_residual_correction", loss_residual_correction, prog_bar=True, sync_dist=True)
+                        self.log(f"{stage}/scheme_d_candidate_recall", candidate_recall, prog_bar=True, sync_dist=True)
+                        if stage == "val":
+                            for i, acc_i in enumerate(candidate_top1[:3]):
+                                self.log(f"val/top1_acc_l4plus_{i + 4}", acc_i, prog_bar=True, sync_dist=True)
+                    if self.sad_rvq_scheme_d_use_prototype_objective:
+                        loss_distribution_alignment, loss_prototype_alignment, loss_residual_correction, top1_acc = self._scheme_d_prototype_losses(
+                            residual_pred,
+                            y_tok[:, 3:, :],
+                        )
+                        self.log(f"{stage}/scheme_d_loss_distribution_alignment", loss_distribution_alignment, prog_bar=True, sync_dist=True)
+                        self.log(f"{stage}/scheme_d_loss_prototype_alignment", loss_prototype_alignment, prog_bar=True, sync_dist=True)
+                        self.log(f"{stage}/scheme_d_loss_residual_correction", loss_residual_correction, prog_bar=True, sync_dist=True)
+                        if stage == "val":
+                            for i, acc_i in enumerate(top1_acc[:3]):
+                                self.log(f"val/top1_acc_l4plus_{i + 4}", acc_i, prog_bar=True, sync_dist=True)
+
+                    if (
+                        stage == "val"
+                        and self.sad_rvq_scheme_d_log_l4_dist
+                        and not bool(getattr(self.trainer, "sanity_checking", False))
+                    ):
+                        correct_dist_mean, wrong_dist_mean = self._scheme_d_l4_distance_stats(
+                            residual_pred,
+                            y_tok[:, 3:, :],
+                        )
+                        self.log("val/correct_dist_mean", correct_dist_mean, prog_bar=True, sync_dist=True)
+                        self.log("val/wrong_dist_mean", wrong_dist_mean, prog_bar=True, sync_dist=True)
+
+                global_step = int(getattr(self.trainer, "global_step", 0))
+                in_proto_warmup = self.sad_rvq_scheme_d_use_prototype_objective and (global_step < self.sad_rvq_scheme_d_warmup_steps)
+
                 if self.sad_rvq_scheme_train_mode == "acoustic_only":
-                    total_loss = self.sad_rvq_scheme_d_acoustic_weight * loss_acoustic_4plus
+                    if self.sad_rvq_scheme_d_use_candidate_objective:
+                        total_loss = (
+                            self.sad_rvq_scheme_d_reg_weight * loss_reg_latent
+                            + self.sad_rvq_scheme_d_distribution_alignment_weight * loss_distribution_alignment
+                            + self.sad_rvq_scheme_d_candidate_ce_weight * loss_candidate_ce
+                            + self.sad_rvq_scheme_d_residual_correction_weight * loss_residual_correction
+                            + self.sad_rvq_scheme_d_codebook_consistency_weight * loss_codebook_consistency
+                        )
+                    elif self.sad_rvq_scheme_d_use_prototype_objective:
+                        if in_proto_warmup:
+                            total_loss = loss_prototype_alignment
+                        else:
+                            total_loss = (
+                                self.sad_rvq_scheme_d_distribution_alignment_weight * loss_distribution_alignment
+                                + 0.5 * loss_prototype_alignment
+                                + 0.1 * loss_residual_correction
+                                + self.sad_rvq_scheme_d_reg_weight * loss_reg_latent
+                                + self.sad_rvq_scheme_d_codebook_consistency_weight * loss_codebook_consistency
+                                + self.sad_rvq_scheme_d_ce_aux_weight * loss_acoustic_4plus
+                            )
+                    else:
+                        total_loss = (
+                            self.sad_rvq_scheme_d_reg_weight * loss_reg_latent
+                            + self.sad_rvq_scheme_d_ce_aux_weight * loss_acoustic_4plus
+                            + self.sad_rvq_scheme_d_codebook_consistency_weight * loss_codebook_consistency
+                        )
                 else:
-                    total_loss = (
-                        self.sad_rvq_scheme_d_final_weight * loss_final_4plus
-                        + self.sad_rvq_scheme_d_acoustic_weight * loss_acoustic_4plus
-                    )
+                    if self.sad_rvq_scheme_d_use_candidate_objective:
+                        total_loss = (
+                            self.sad_rvq_scheme_d_final_weight * loss_final_4plus
+                            + self.sad_rvq_scheme_d_reg_weight * loss_reg_latent
+                            + self.sad_rvq_scheme_d_distribution_alignment_weight * loss_distribution_alignment
+                            + self.sad_rvq_scheme_d_candidate_ce_weight * loss_candidate_ce
+                            + self.sad_rvq_scheme_d_residual_correction_weight * loss_residual_correction
+                            + self.sad_rvq_scheme_d_codebook_consistency_weight * loss_codebook_consistency
+                        )
+                    elif self.sad_rvq_scheme_d_use_prototype_objective:
+                        if in_proto_warmup:
+                            total_loss = self.sad_rvq_scheme_d_final_weight * loss_final_4plus + loss_prototype_alignment
+                        else:
+                            total_loss = (
+                                self.sad_rvq_scheme_d_final_weight * loss_final_4plus
+                                + self.sad_rvq_scheme_d_distribution_alignment_weight * loss_distribution_alignment
+                                + 0.5 * loss_prototype_alignment
+                                + 0.1 * loss_residual_correction
+                                + self.sad_rvq_scheme_d_reg_weight * loss_reg_latent
+                                + self.sad_rvq_scheme_d_codebook_consistency_weight * loss_codebook_consistency
+                            )
+                    else:
+                        total_loss = (
+                            self.sad_rvq_scheme_d_final_weight * loss_final_4plus
+                            + self.sad_rvq_scheme_d_acoustic_weight * loss_acoustic_4plus
+                            + self.sad_rvq_scheme_d_reg_weight * loss_reg_latent
+                            + self.sad_rvq_scheme_d_codebook_consistency_weight * loss_codebook_consistency
+                        )
                 self.log(f"{stage}/scheme_d_loss_acoustic_l4plus", loss_acoustic_4plus, prog_bar=True, sync_dist=True)
             self.log(f"{stage}/scheme_d_loss_final_l4plus", loss_final_4plus, prog_bar=True, sync_dist=True)
             self.log(f"{stage}/ce_l4plus_fused", loss_final_4plus, prog_bar=False, sync_dist=True)
@@ -911,7 +1664,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             log_p, residual_pred, _, logits_raw = self.log_score(y_q_step, x_q, x_cont=x_cont, return_raw_logits=True)
 
             # Apply post-3-layer fusion schemes in inference sampling loop as well.
-            if self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} and self.scheme_d_acoustic_head is not None:
+            if self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} and self.scheme_d_acoustic_heads is not None:
                 fused_logits, _, _ = self._scheme_d_fuse_logits(logits_raw, x_cont if x_cont is not None else x_q.mean(dim=2))
                 log_p = fused_logits.log_softmax(dim=-1)
             
