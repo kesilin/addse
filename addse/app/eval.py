@@ -1,5 +1,6 @@
 import itertools
 import os
+import random
 import re
 import sqlite3
 from collections.abc import Mapping
@@ -46,6 +47,10 @@ def eval(
     no_lm: Annotated[bool, typer.Option(help="Whether to skip the model.")] = False,
     compute_loss: Annotated[bool, typer.Option(help="Whether to compute and store the loss.")] = False,
     no_metrics: Annotated[bool, typer.Option(help="Whether to not compute any metric")] = False,
+    eval_min_duration: Annotated[float, typer.Option(help="Minimum duration in seconds for evaluation items.")] = 0.0,
+    eval_min_active_duration: Annotated[float, typer.Option(help="Minimum active-speech duration in seconds.")] = 0.0,
+    eval_active_threshold: Annotated[float, typer.Option(help="Energy threshold for active-speech masking.")] = 0.01,
+    eval_seed: Annotated[int, typer.Option(help="Random seed for deterministic evaluation sampling.")] = 42,
 ) -> None:
     """Evaluate a model."""
     if not os.path.exists(config_file):
@@ -64,9 +69,29 @@ def eval(
         raise ValueError(f"Device must be 'auto', 'cpu', or 'cuda'. Got '{device}'.")
     print(f"Using device: {device}")
 
+    random.seed(eval_seed)
+    np.random.seed(eval_seed)
+    torch.manual_seed(eval_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(eval_seed)
+
     load_dotenv()
 
     base_cfg, config_name = load_hydra_config(config_file, overrides=overrides)
+
+    if isinstance(base_cfg.get("eval"), DictConfig) and isinstance(base_cfg.eval.get("dsets"), DictConfig):
+        with open_dict(base_cfg):
+            for _, dcfg in base_cfg.eval.dsets.items():
+                if isinstance(dcfg, DictConfig):
+                    dcfg.reset_rngs = True
+                    dcfg.resume = False
+                    dcfg.seed = int(eval_seed)
+                    if isinstance(dcfg.get("speech_dataset"), DictConfig):
+                        dcfg.speech_dataset.shuffle = False
+                        dcfg.speech_dataset.seed = int(eval_seed + 1)
+                    if isinstance(dcfg.get("noise_dataset"), DictConfig):
+                        dcfg.noise_dataset.shuffle = False
+                        dcfg.noise_dataset.seed = int(eval_seed + 2)
 
     config_name = base_cfg.get("name", config_name)
 
@@ -160,6 +185,9 @@ def eval(
                 out_q,
                 overwrite,
                 num_examples,
+                eval_min_duration,
+                eval_min_active_duration,
+                eval_active_threshold,
                 clean_input,
                 return_nfe,
                 compute_loss,
@@ -179,6 +207,9 @@ def eval(
             out_q,
             overwrite,
             num_examples,
+            eval_min_duration,
+            eval_min_active_duration,
+            eval_active_threshold,
             clean_input,
             return_nfe,
             compute_loss,
@@ -198,6 +229,9 @@ def eval(
             out_q,
             overwrite,
             num_examples,
+            eval_min_duration,
+            eval_min_active_duration,
+            eval_active_threshold,
             clean_input,
             return_nfe,
             compute_loss,
@@ -234,6 +268,9 @@ def iterate_and_compute_metrics(
     out_q: "Queue | None",
     overwrite: bool,
     num_examples: int | None,
+    eval_min_duration: float,
+    eval_min_active_duration: float,
+    eval_active_threshold: float,
     clean_input: bool,
     return_nfe: bool,
     compute_loss: bool,
@@ -242,6 +279,8 @@ def iterate_and_compute_metrics(
     assert (in_q is None and out_q is None) or (in_q is not None and out_q is not None)
 
     for dset_name, dset in dsets.items():
+        target_examples = len(dset) if num_examples is None else int(num_examples)
+        print(f"{name} | {dset_name}: target examples = {target_examples}")
         existing_results = db.execute(
             "SELECT COUNT(*) FROM results WHERE dset = ? AND name = ?", (dset_name, name)
         ).fetchone()[0]
@@ -250,7 +289,20 @@ def iterate_and_compute_metrics(
             print(f"Skipping {dset_name} for {name} as results already exist in the database.")
             continue
 
+        num_accepted = 0
+        num_seen = 0
         for idx, (x, y, fs) in tqdm(enumerate(dset), desc=f"{name} | {dset_name}"):
+            num_seen += 1
+            if eval_min_duration > 0:
+                duration = float(y.shape[-1]) / float(fs)
+                if duration < eval_min_duration:
+                    continue
+            if eval_min_active_duration > 0:
+                active = (y.abs() > eval_active_threshold).float().sum().item()
+                active_duration = active / float(fs)
+                if active_duration < eval_min_active_duration:
+                    continue
+
             y_hat_torch: torch.Tensor | None = None
             nfe: int | None = None
             loss: dict[str, torch.Tensor] | None = None
@@ -304,8 +356,12 @@ def iterate_and_compute_metrics(
                 assert y_np is not None
                 in_q.put((idx, y_hat_np, y_np))
 
-            if num_examples is not None and idx + 1 >= num_examples:
+            num_accepted += 1
+            if num_examples is not None and num_accepted >= num_examples:
                 break
+
+        filtered = max(0, num_seen - num_accepted)
+        print(f"{name} | {dset_name}: accepted={num_accepted}, filtered={filtered}, min_duration={eval_min_duration}, min_active_duration={eval_min_active_duration}")
 
         if in_q is not None:
             in_q.join()

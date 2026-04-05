@@ -122,6 +122,29 @@ class ResidualMLPHead(nn.Module):
         x = self.fc2(x)
         return x + residual
 
+
+class TemporalResidualBlock(nn.Module):
+    def __init__(self, channels: int, kernel_size: int = 3, dilation: int = 1) -> None:
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.net = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                dilation=dilation,
+                groups=channels,
+            ),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.net(x)
+
 @dataclass
 class LogConfig:
     on_train_step: bool = False
@@ -296,27 +319,69 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.sad_rvq_scheme_d_continuous_multiscale_spec_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_multiscale_spec_weight", 0.0))
         self.sad_rvq_scheme_d_continuous_multiscale_spec_nffts = tuple(kwargs.get("sad_rvq_scheme_d_continuous_multiscale_spec_nffts", (512, 1024, 2048)))
         self.sad_rvq_scheme_d_continuous_multiscale_spec_hops = tuple(kwargs.get("sad_rvq_scheme_d_continuous_multiscale_spec_hops", (128, 256, 512)))
+        self.continuous_residual_use_multiscale_stft = bool(kwargs.get("continuous_residual_use_multiscale_stft", False))
+        self.continuous_residual_multiscale_nffts = tuple(kwargs.get("continuous_residual_multiscale_nffts", (512, 1024, 2048)))
+        self.continuous_residual_multiscale_hops = tuple(kwargs.get("continuous_residual_multiscale_hops", (128, 256, 512)))
+        self.continuous_residual_multiscale_wins = tuple(kwargs.get("continuous_residual_multiscale_wins", (512, 1024, 2048)))
+        self.continuous_residual_predictor_channels = int(kwargs.get("continuous_residual_predictor_channels", 256))
+        self.continuous_residual_predictor_blocks = int(kwargs.get("continuous_residual_predictor_blocks", 3))
+        self.continuous_residual_train_only = bool(kwargs.get("continuous_residual_train_only", False))
+        self.continuous_residual_joint_train = bool(kwargs.get("continuous_residual_joint_train", False))
+        self.continuous_residual_lr_scale = float(kwargs.get("continuous_residual_lr_scale", 3.0))
+        self.continuous_residual_backbone_lr_scale = float(kwargs.get("continuous_residual_backbone_lr_scale", 0.1))
+        self.continuous_residual_probe_scale = float(kwargs.get("continuous_residual_probe_scale", 1.0))
+        self.continuous_residual_init_bias = float(kwargs.get("continuous_residual_init_bias", 0.0))
+        self.continuous_residual_zero_mean = bool(kwargs.get("continuous_residual_zero_mean", False))
+        self.continuous_residual_warmup_steps = int(kwargs.get("continuous_residual_warmup_steps", 0))
+        self.continuous_residual_warmup_weight = float(kwargs.get("continuous_residual_warmup_weight", 1.0))
+        self.continuous_residual_warmup_residual_only = bool(kwargs.get("continuous_residual_warmup_residual_only", False))
+        self.continuous_residual_warmup_mag_weight = float(kwargs.get("continuous_residual_warmup_mag_weight", 0.0))
+        self.continuous_residual_warmup_phase_weight = float(kwargs.get("continuous_residual_warmup_phase_weight", 0.0))
+        self.continuous_residual_warmup_stft_nfft = int(kwargs.get("continuous_residual_warmup_stft_nfft", 512))
+        self.continuous_residual_warmup_stft_hop = int(kwargs.get("continuous_residual_warmup_stft_hop", 128))
+        self.continuous_residual_warmup_stft_win = int(kwargs.get("continuous_residual_warmup_stft_win", 512))
+        self.continuous_gain_margin = float(kwargs.get("continuous_gain_margin", 0.0))
+        self.continuous_gain_penalty_weight = float(kwargs.get("continuous_gain_penalty_weight", 0.0))
         self.continuous_stft_encoder: nn.Module | None = None
         self.continuous_stft_residual_predictor: nn.Module | None = None
         self.sad_rvq_scheme_train_mode = str(kwargs.get("sad_rvq_scheme_train_mode", "normal")).lower()
         self.sad_rvq_freeze_main_model = bool(kwargs.get("sad_rvq_freeze_main_model", False))
 
         if self.sad_rvq_scheme_d_continuous_use_stft_predictor:
-            self.continuous_stft_encoder = nn.Sequential(
-                nn.Conv2d(2, 32, kernel_size=3, padding=1),
-                nn.GELU(),
-                nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.GELU(),
+            encoder_scales = len(self.continuous_residual_multiscale_nffts) if self.continuous_residual_use_multiscale_stft else 1
+            self.continuous_stft_encoder = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Conv2d(2, 32, kernel_size=3, padding=1),
+                        nn.GELU(),
+                        nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                        nn.GELU(),
+                    )
+                    for _ in range(encoder_scales)
+                ]
             )
-            self.continuous_stft_residual_predictor = nn.Sequential(
-                nn.Conv1d(64, 256, kernel_size=3, padding=1),
+            fusion_in_channels = 64 * encoder_scales
+            predictor_channels = max(128, self.continuous_residual_predictor_channels)
+            predictor_blocks = max(1, self.continuous_residual_predictor_blocks)
+            predictor_layers: list[nn.Module] = [
+                nn.Conv1d(fusion_in_channels, predictor_channels, kernel_size=1),
                 nn.GELU(),
-                nn.Upsample(scale_factor=4, mode="linear", align_corners=False),
-                nn.Conv1d(256, 256, kernel_size=3, padding=1),
-                nn.GELU(),
-                nn.Upsample(scale_factor=80, mode="linear", align_corners=False),
-                nn.Conv1d(256, 1, kernel_size=3, padding=1),
+            ]
+            for idx in range(predictor_blocks):
+                predictor_layers.append(TemporalResidualBlock(predictor_channels, kernel_size=3, dilation=2 ** idx))
+            predictor_layers.extend(
+                [
+                    nn.Conv1d(predictor_channels, predictor_channels, kernel_size=3, padding=1),
+                    nn.GELU(),
+                    nn.Conv1d(predictor_channels, 1, kernel_size=1),
+                ]
             )
+            self.continuous_stft_residual_predictor = nn.Sequential(*predictor_layers)
+            if self.continuous_residual_init_bias != 0.0:
+                last = self.continuous_stft_residual_predictor[-1]
+                if isinstance(last, nn.Conv1d) and last.bias is not None:
+                    with torch.no_grad():
+                        last.bias.fill_(self.continuous_residual_init_bias)
         
         # Scheme D: Initialize learnable router
         scheme_with_acoustic = self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} or self.sad_rvq_scheme_d_enabled
@@ -464,6 +529,106 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
         if self.sad_rvq_scheme_d_train_post3_only:
             self._scheme_d_apply_post3_train_only()
+
+        if self.continuous_residual_train_only:
+            self._apply_continuous_residual_train_only_requires_grad()
+        elif self.continuous_residual_joint_train:
+            self._apply_continuous_residual_joint_train_requires_grad()
+
+    def _is_continuous_residual_param(self, name: str) -> bool:
+        return "continuous_stft_encoder" in name or "continuous_stft_residual_predictor" in name
+
+    def _apply_continuous_residual_train_only_requires_grad(self) -> None:
+        for name, param in self.named_parameters():
+            param.requires_grad = self._is_continuous_residual_param(name)
+
+    def _is_continuous_residual_backbone_param(self, name: str) -> bool:
+        return name.startswith("model.")
+
+    def _apply_continuous_residual_joint_train_requires_grad(self) -> None:
+        for name, param in self.named_parameters():
+            param.requires_grad = self._is_continuous_residual_param(name) or self._is_continuous_residual_backbone_param(name)
+
+    def _get_base_optimizer_lr(self) -> float:
+        opt = self.optimizer
+        if hasattr(opt, "keywords") and isinstance(opt.keywords, dict) and opt.keywords.get("lr") is not None:
+            return float(opt.keywords["lr"])
+        if hasattr(opt, "defaults") and isinstance(opt.defaults, dict) and opt.defaults.get("lr") is not None:
+            return float(opt.defaults["lr"])
+        return 1e-4
+
+    def _apply_continuous_residual_train_mode(self) -> None:
+        if not (self.continuous_residual_train_only or self.continuous_residual_joint_train):
+            return
+        # Keep frozen modules in eval mode to avoid train-time drift on the pretrained backbone.
+        self.eval()
+        if self.continuous_stft_encoder is not None:
+            self.continuous_stft_encoder.train()
+        if self.continuous_stft_residual_predictor is not None:
+            self.continuous_stft_residual_predictor.train()
+
+    def on_train_start(self) -> None:
+        self._apply_continuous_residual_train_mode()
+
+    def on_train_epoch_start(self) -> None:
+        self._apply_continuous_residual_train_mode()
+
+    def train(self, mode: bool = True) -> "ADDSELightningModule":
+        super().train(mode)
+        if mode and (self.continuous_residual_train_only or self.continuous_residual_joint_train):
+            self._apply_continuous_residual_train_mode()
+        return self
+
+    def configure_optimizers(self) -> Any:
+        if self.continuous_residual_train_only:
+            trainable_params = [
+                p
+                for name, p in self.named_parameters()
+                if p.requires_grad and self._is_continuous_residual_param(name)
+            ]
+            if len(trainable_params) == 0:
+                raise ValueError("continuous_residual_train_only is enabled, but no residual parameters are trainable")
+
+            optimizer = self.optimizer(trainable_params)
+            lr_scale = max(float(self.continuous_residual_lr_scale), 1e-8)
+            for group in optimizer.param_groups:
+                group["lr"] = float(group.get("lr", 0.0)) * lr_scale
+
+            output: dict[str, Any] = {"optimizer": optimizer}
+            if self.lr_scheduler is not None:
+                output["lr_scheduler"] = {
+                    k: v(optimizer) if k == "scheduler" else v for k, v in self.lr_scheduler.items()
+                }
+            return output
+
+        if self.continuous_residual_joint_train:
+            backbone_params = []
+            branch_params = []
+            for name, param in self.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if self._is_continuous_residual_backbone_param(name):
+                    backbone_params.append(param)
+                elif self._is_continuous_residual_param(name):
+                    branch_params.append(param)
+
+            if len(backbone_params) == 0 or len(branch_params) == 0:
+                raise ValueError("continuous_residual_joint_train is enabled, but backbone/branch parameters are missing")
+
+            base_lr = self._get_base_optimizer_lr()
+
+            optimizer = self.optimizer([
+                {"params": backbone_params, "lr": base_lr * max(self.continuous_residual_backbone_lr_scale, 1e-8)},
+                {"params": branch_params, "lr": base_lr * max(self.continuous_residual_lr_scale, 1e-8)},
+            ])
+            output: dict[str, Any] = {"optimizer": optimizer}
+            if self.lr_scheduler is not None:
+                output["lr_scheduler"] = {
+                    k: v(optimizer) if k == "scheduler" else v for k, v in self.lr_scheduler.items()
+                }
+            return output
+
+        return ConfigureOptimizersMixin.configure_optimizers(self)
 
     def _init_scheme_d_acoustic_head_from_codebook(self) -> None:
         if self.scheme_d_acoustic_heads is None:
@@ -907,6 +1072,53 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         fused_wave = base_wave + wave_delta
         return fused_wave, wave_delta
 
+    def _predict_stft_wave_residual(self, noisy_wave: Tensor, base_wave: Tensor) -> tuple[Tensor, Tensor]:
+        if self.continuous_stft_encoder is None or self.continuous_stft_residual_predictor is None:
+            raise RuntimeError("continuous STFT predictor is not initialized")
+        noisy_mono = noisy_wave.squeeze(1)
+
+        if isinstance(self.continuous_stft_encoder, nn.ModuleList):
+            encoder_scales = list(self.continuous_stft_encoder)
+            nffts = list(self.continuous_residual_multiscale_nffts)
+            hops = list(self.continuous_residual_multiscale_hops)
+            wins = list(self.continuous_residual_multiscale_wins)
+        else:
+            encoder_scales = [self.continuous_stft_encoder]
+            nffts = [self.sad_rvq_scheme_d_continuous_stft_nfft]
+            hops = [self.sad_rvq_scheme_d_continuous_stft_hop]
+            wins = [self.sad_rvq_scheme_d_continuous_stft_win]
+
+        fused_features: list[Tensor] = []
+        target_time = 0
+        for encoder, n_fft, hop_length, win_length in zip(encoder_scales, nffts, hops, wins):
+            stft_window = torch.hann_window(win_length, device=noisy_mono.device, dtype=noisy_mono.dtype)
+            noisy_stft = torch.stft(
+                noisy_mono,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=stft_window,
+                return_complex=True,
+            )
+            noisy_stft_ri = torch.stack([noisy_stft.real, noisy_stft.imag], dim=1)
+            encoded = encoder(noisy_stft_ri).mean(dim=2)
+            target_time = max(target_time, encoded.shape[-1])
+            fused_features.append(encoded)
+
+        aligned_features = [
+            feat if feat.shape[-1] == target_time else F.interpolate(feat, size=target_time, mode="linear", align_corners=False)
+            for feat in fused_features
+        ]
+        stft_feat = torch.cat(aligned_features, dim=1)
+        wave_delta = self.continuous_stft_residual_predictor(stft_feat)
+        wave_delta = F.interpolate(wave_delta, size=base_wave.shape[-1], mode="linear", align_corners=False)
+        if self.continuous_residual_zero_mean:
+            wave_delta = wave_delta - wave_delta.mean(dim=-1, keepdim=True)
+        if self.continuous_residual_probe_scale != 1.0:
+            wave_delta = wave_delta * float(self.continuous_residual_probe_scale)
+        enhanced_wave = base_wave + wave_delta
+        return enhanced_wave, wave_delta
+
     def _apply_trainable_param_patterns(self, patterns: Iterable[str]) -> None:
         normalized = [p for p in patterns if isinstance(p, str) and p.strip()]
         if not normalized:
@@ -1063,6 +1275,36 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             total = total + F.l1_loss(stft_pred.abs(), stft_target.abs())
         return total / max(1, n)
 
+    def _stft_mag_phase_losses(self, pred: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
+        pred_mono = pred.squeeze(1)
+        target_mono = target.squeeze(1)
+        n_fft = max(16, int(self.continuous_residual_warmup_stft_nfft))
+        hop = max(1, int(self.continuous_residual_warmup_stft_hop))
+        win = max(16, int(self.continuous_residual_warmup_stft_win))
+        window = torch.hann_window(win, device=pred.device, dtype=pred.dtype)
+
+        stft_pred = torch.stft(
+            pred_mono,
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=win,
+            window=window,
+            return_complex=True,
+        )
+        stft_target = torch.stft(
+            target_mono,
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=win,
+            window=window,
+            return_complex=True,
+        )
+
+        mag_loss = F.l1_loss(stft_pred.abs(), stft_target.abs())
+        phase_delta = torch.angle(stft_pred) - torch.angle(stft_target)
+        phase_loss = 1.0 - torch.cos(phase_delta).mean()
+        return mag_loss, phase_loss
+
     def _pesq_target(self, pred: Tensor, target: Tensor, max_items: int = 1) -> Tensor:
         if pesq is None:
             return torch.full((min(pred.shape[0], max_items), 1), 0.5, device=pred.device, dtype=pred.dtype)
@@ -1123,27 +1365,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 coarse_wave = self._decode_latent_to_wave(coarse_lat.detach(), target_length=y.shape[-1])
 
             if self.sad_rvq_scheme_d_continuous_use_stft_predictor:
-                if self.continuous_stft_encoder is None or self.continuous_stft_residual_predictor is None:
-                    raise RuntimeError("continuous STFT predictor is not initialized")
-                noisy_mono = x[..., : y.shape[-1]].squeeze(1)
-                stft_window = torch.hann_window(
-                    self.sad_rvq_scheme_d_continuous_stft_win,
-                    device=noisy_mono.device,
-                    dtype=noisy_mono.dtype,
-                )
-                noisy_stft = torch.stft(
-                    noisy_mono,
-                    n_fft=self.sad_rvq_scheme_d_continuous_stft_nfft,
-                    hop_length=self.sad_rvq_scheme_d_continuous_stft_hop,
-                    win_length=self.sad_rvq_scheme_d_continuous_stft_win,
-                    window=stft_window,
-                    return_complex=True,
-                )
-                noisy_stft_ri = torch.stack([noisy_stft.real, noisy_stft.imag], dim=1)
-                stft_feat = self.continuous_stft_encoder(noisy_stft_ri).mean(dim=2)
-                wave_delta = self.continuous_stft_residual_predictor(stft_feat)
-                wave_delta = F.interpolate(wave_delta, size=coarse_wave.shape[-1], mode="linear", align_corners=False)
-                enhanced_wave = coarse_wave + wave_delta
+                enhanced_wave, wave_delta = self._predict_stft_wave_residual(x[..., : y.shape[-1]], coarse_wave)
             else:
                 enhanced_wave, wave_delta = self._predict_wave_residual(x, coarse_wave, None)
 
@@ -1155,12 +1377,19 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             loss_coarse = self._si_sdr_loss(coarse_wave, y_target)
             loss_enhanced = self._si_sdr_loss(enhanced_wave, y_target)
             noisy_si_sdr_loss = self._si_sdr_loss(x[..., :min_len], y_target)
+            gain_vs_noisy = noisy_si_sdr_loss - loss_enhanced
+            global_step = int(getattr(self.trainer, "global_step", 0))
+            in_warmup = stage == "train" and self.continuous_residual_warmup_steps > 0 and global_step < self.continuous_residual_warmup_steps
             total_loss = (
                 self.sad_rvq_scheme_d_continuous_coarse_weight * loss_coarse
                 + self.sad_rvq_scheme_d_continuous_enhanced_weight * loss_enhanced
             )
 
-            if self.sad_rvq_scheme_d_continuous_front3_ce_weight > 0 and front_books > 0:
+            if (
+                self.sad_rvq_scheme_d_continuous_front3_ce_weight > 0
+                and front_books > 0
+                and not (in_warmup and self.continuous_residual_warmup_residual_only)
+            ):
                 mask_front = mask[:, :front_books, :]
                 front_ce = F.cross_entropy(
                     logits_for_ce[:, :front_books, :, :].reshape(-1, V),
@@ -1174,6 +1403,33 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             self.log(f"{stage}/cont_loss_coarse", loss_coarse, prog_bar=True, sync_dist=True)
             self.log(f"{stage}/cont_loss_enhanced", loss_enhanced, prog_bar=True, sync_dist=True)
             self.log(f"{stage}/cont_loss_noisy", noisy_si_sdr_loss, prog_bar=True, sync_dist=True)
+            self.log(f"{stage}/cont_gain_vs_noisy", gain_vs_noisy, prog_bar=True, sync_dist=True)
+
+            if in_warmup and wave_delta is not None:
+                wave_delta = wave_delta[..., :min_len]
+                warmup_target = (y_target - coarse_wave).detach()
+                warmup_l1 = F.l1_loss(wave_delta, warmup_target)
+                warmup_total = self.continuous_residual_warmup_weight * warmup_l1
+                self.log(f"{stage}/cont_warmup_res_l1", warmup_l1, prog_bar=True, sync_dist=True)
+
+                if self.continuous_residual_warmup_mag_weight > 0 or self.continuous_residual_warmup_phase_weight > 0:
+                    warmup_mag, warmup_phase = self._stft_mag_phase_losses(enhanced_wave, y_target)
+                    if self.continuous_residual_warmup_mag_weight > 0:
+                        warmup_total = warmup_total + self.continuous_residual_warmup_mag_weight * warmup_mag
+                        self.log(f"{stage}/cont_warmup_mag", warmup_mag, prog_bar=True, sync_dist=True)
+                    if self.continuous_residual_warmup_phase_weight > 0:
+                        warmup_total = warmup_total + self.continuous_residual_warmup_phase_weight * warmup_phase
+                        self.log(f"{stage}/cont_warmup_phase", warmup_phase, prog_bar=True, sync_dist=True)
+
+                if self.continuous_residual_warmup_residual_only:
+                    total_loss = warmup_total
+                else:
+                    total_loss = self.sad_rvq_scheme_d_continuous_coarse_weight * loss_coarse + warmup_total
+
+            if not in_warmup and self.continuous_gain_penalty_weight > 0 and self.continuous_gain_margin > 0:
+                gain_penalty = F.relu(self.continuous_gain_margin - gain_vs_noisy)
+                total_loss = total_loss + self.continuous_gain_penalty_weight * gain_penalty
+                self.log(f"{stage}/cont_gain_margin_penalty", gain_penalty, prog_bar=True, sync_dist=True)
 
             if wave_delta is not None:
                 wave_delta = wave_delta[..., :min_len]
@@ -1215,7 +1471,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
             if metrics or (stage == "val" and batch_idx == 0):
                 solve_out = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat, x_wave=x)
-                if self.wave_residual_enabled:
+                if self.sad_rvq_scheme_d_continuous_use_stft_predictor or self.wave_residual_enabled:
                     y_hat = solve_out
                 else:
                     y_lat_fused = solve_out
@@ -1710,6 +1966,14 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         if y_q_discrete.ndim == 4:
             y_q_discrete = y_q_discrete.sum(dim=1) if y_q_discrete.shape[1] == K else y_q_discrete.sum(dim=2)
 
+        if x_wave is not None and self.sad_rvq_scheme_d_continuous_residual_mode and self.sad_rvq_scheme_d_continuous_use_stft_predictor:
+            if self.sad_rvq_scheme_d_continuous_coarse_source == "noisy":
+                base_wave = x_wave[..., : x_wave.shape[-1]]
+            else:
+                base_wave = self._decode_latent_to_wave(y_q_discrete, target_length=x_wave.shape[-1])
+            wave_fused, _ = self._predict_stft_wave_residual(x_wave[..., : base_wave.shape[-1]], base_wave)
+            return wave_fused[..., : x_wave.shape[-1]]
+
         if self.wave_residual_enabled and x_wave is not None:
             base_wave = self._decode_latent_to_wave(y_q_discrete, target_length=x_wave.shape[-1])
             wave_fused, _ = self._predict_wave_residual(x_wave, base_wave, final_residual)
@@ -1779,7 +2043,9 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         
         # solve 在 wave_residual_enabled 时直接返回波形晚期融合结果。
         solve_out = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat, x_wave=x_pad)
-        if self.wave_residual_enabled:
+        if self.sad_rvq_scheme_d_continuous_residual_mode and self.sad_rvq_scheme_d_continuous_use_stft_predictor:
+            y_hat_pad = solve_out
+        elif self.wave_residual_enabled:
             y_hat_pad = solve_out
         else:
             y_hat_pad = self._decode_latent_to_wave(solve_out, target_length=x_pad.shape[-1])

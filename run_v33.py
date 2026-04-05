@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import shutil
 import sys
 import random
@@ -23,6 +24,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--train-shuffle", action="store_true", help="Enable train dataloader shuffle")
     parser.add_argument("--eval-examples", type=int, default=60)
+    parser.add_argument("--eval-min-duration", type=float, default=1.0, help="Minimum duration in seconds for evaluation items")
+    parser.add_argument("--eval-min-active-duration", type=float, default=0.5, help="Minimum active-speech duration in seconds")
+    parser.add_argument("--eval-active-threshold", type=float, default=0.01, help="Amplitude threshold for active-speech masking")
+    parser.add_argument("--eval-seed", type=int, default=42, help="Seed to keep evaluation sampling deterministic")
     parser.add_argument("--eval-steps", type=int, default=200, help="Diffusion steps during eval; use 200 for strict evaluation")
     parser.add_argument("--val-every", type=int, default=1)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
@@ -32,6 +37,29 @@ if __name__ == "__main__":
     parser.add_argument("--output-db", type=str, default="v33_decoupled.db")
     parser.add_argument("--output-dir", type=str, default="saved_audio_v33")
     parser.add_argument("--disable-wave-residual", action="store_true", help="Disable wave residual side-stream branch")
+    parser.add_argument("--continuous-residual-train-only", action="store_true", help="Freeze all modules except continuous STFT residual branch")
+    parser.add_argument("--continuous-residual-joint-train", action="store_true", help="Train backbone and residual branch jointly with separate learning rates")
+    parser.add_argument("--continuous-residual-lr-scale", type=float, default=3.0, help="LR scale when continuous residual train-only is enabled")
+    parser.add_argument("--continuous-residual-backbone-lr-scale", type=float, default=0.1, help="Backbone LR scale for joint training")
+    parser.add_argument("--continuous-residual-probe-scale", type=float, default=1.0, help="Scale factor for residual probe injection")
+    parser.add_argument("--continuous-residual-init-bias", type=float, default=0.0, help="Initial bias for the residual predictor output conv")
+    parser.add_argument("--continuous-residual-zero-mean", action="store_true", help="Force residual prediction to zero-mean per sample")
+    parser.add_argument("--continuous-residual-warmup-steps", type=int, default=0, help="Warmup steps using direct residual L1 objective")
+    parser.add_argument("--continuous-residual-warmup-weight", type=float, default=1.0, help="Weight for direct residual L1 warmup objective")
+    parser.add_argument("--continuous-residual-warmup-residual-only", action="store_true", help="Use residual warmup objective only during warmup window")
+    parser.add_argument("--continuous-residual-warmup-mag-weight", type=float, default=0.0, help="STFT magnitude loss weight during residual warmup")
+    parser.add_argument("--continuous-residual-warmup-phase-weight", type=float, default=0.0, help="STFT phase consistency loss weight during residual warmup")
+    parser.add_argument("--continuous-residual-warmup-stft-nfft", type=int, default=512, help="NFFT used by warmup STFT mag/phase loss")
+    parser.add_argument("--continuous-residual-warmup-stft-hop", type=int, default=128, help="Hop length used by warmup STFT mag/phase loss")
+    parser.add_argument("--continuous-residual-warmup-stft-win", type=int, default=512, help="Window length used by warmup STFT mag/phase loss")
+    parser.add_argument("--continuous-gain-margin", type=float, default=0.0, help="Target minimum gain_vs_noisy margin")
+    parser.add_argument("--continuous-gain-penalty-weight", type=float, default=0.0, help="Penalty weight when gain_vs_noisy is below margin")
+    parser.add_argument("--continuous-residual-use-multiscale-stft", action="store_true", help="Use multiscale STFT features in the residual branch")
+    parser.add_argument("--continuous-residual-predictor-channels", type=int, default=256, help="Hidden channels for the residual predictor")
+    parser.add_argument("--continuous-residual-predictor-blocks", type=int, default=3, help="Number of temporal residual blocks in the predictor")
+    parser.add_argument("--continuous-residual-multiscale-nffts", type=str, default="512,1024,2048", help="Comma-separated FFT sizes for multiscale STFT")
+    parser.add_argument("--continuous-residual-multiscale-hops", type=str, default="128,256,512", help="Comma-separated hop sizes for multiscale STFT")
+    parser.add_argument("--continuous-residual-multiscale-wins", type=str, default="512,1024,2048", help="Comma-separated window sizes for multiscale STFT")
     parser.add_argument("--direct-residual-weight", type=float, default=1.0, help="Weight for explicit DEX residual supervision")
     parser.add_argument("--residual-l1-weight", type=float, default=0.0, help="Fallback latent residual L1 weight")
     parser.add_argument("--si-sdr-weight", type=float, default=0.2, help="Wave-domain SI-SDR weight for this run")
@@ -41,6 +69,8 @@ if __name__ == "__main__":
     parser.add_argument("--alpha-init-prob", type=float, default=0.05, help="Initial sigmoid probability for alpha gates")
     parser.add_argument("--print-alpha", action="store_true", help="Print alpha logs in progress bar (handled in lightning logs)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducible runs")
+    parser.add_argument("--disable-pretrained-ckpt", action="store_true", help="Disable lm.pretrained_ckpt loading to avoid mismatch interference")
+    parser.add_argument("--eval-ckpt-policy", type=str, default="best", choices=["best", "last"], help="Checkpoint policy for evaluation")
 
     # ===== SAD-RVQ Scheme Selection =====
     parser.add_argument("--sad-rvq-scheme", type=str, default="baseline", choices=["baseline", "a", "b", "c", "d", "e", "f", "g", "h"],
@@ -132,6 +162,11 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    pretrained_ckpt_override = "++lm.pretrained_ckpt=null" if args.disable_pretrained_ckpt else None
+    multiscale_nffts = [int(x) for x in args.continuous_residual_multiscale_nffts.split(",") if x.strip()]
+    multiscale_hops = [int(x) for x in args.continuous_residual_multiscale_hops.split(",") if x.strip()]
+    multiscale_wins = [int(x) for x in args.continuous_residual_multiscale_wins.split(",") if x.strip()]
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
@@ -184,6 +219,29 @@ if __name__ == "__main__":
 
             # ==== 1.2 实验开关 ====
             f"++lm.wave_residual_enabled={str((not args.disable_wave_residual)).lower()}",
+            f"++lm.continuous_residual_train_only={str(args.continuous_residual_train_only).lower()}",
+            f"++lm.continuous_residual_joint_train={str(args.continuous_residual_joint_train).lower()}",
+            f"++lm.continuous_residual_lr_scale={args.continuous_residual_lr_scale}",
+            f"++lm.continuous_residual_backbone_lr_scale={args.continuous_residual_backbone_lr_scale}",
+            f"++lm.continuous_residual_probe_scale={args.continuous_residual_probe_scale}",
+            f"++lm.continuous_residual_init_bias={args.continuous_residual_init_bias}",
+            f"++lm.continuous_residual_zero_mean={str(args.continuous_residual_zero_mean).lower()}",
+            f"++lm.continuous_residual_warmup_steps={args.continuous_residual_warmup_steps}",
+            f"++lm.continuous_residual_warmup_weight={args.continuous_residual_warmup_weight}",
+            f"++lm.continuous_residual_warmup_residual_only={str(args.continuous_residual_warmup_residual_only).lower()}",
+            f"++lm.continuous_residual_warmup_mag_weight={args.continuous_residual_warmup_mag_weight}",
+            f"++lm.continuous_residual_warmup_phase_weight={args.continuous_residual_warmup_phase_weight}",
+            f"++lm.continuous_residual_warmup_stft_nfft={args.continuous_residual_warmup_stft_nfft}",
+            f"++lm.continuous_residual_warmup_stft_hop={args.continuous_residual_warmup_stft_hop}",
+            f"++lm.continuous_residual_warmup_stft_win={args.continuous_residual_warmup_stft_win}",
+            f"++lm.continuous_gain_margin={args.continuous_gain_margin}",
+            f"++lm.continuous_gain_penalty_weight={args.continuous_gain_penalty_weight}",
+            f"++lm.continuous_residual_use_multiscale_stft={str(args.continuous_residual_use_multiscale_stft).lower()}",
+            f"++lm.continuous_residual_predictor_channels={args.continuous_residual_predictor_channels}",
+            f"++lm.continuous_residual_predictor_blocks={args.continuous_residual_predictor_blocks}",
+            f"++lm.continuous_residual_multiscale_nffts={multiscale_nffts}",
+            f"++lm.continuous_residual_multiscale_hops={multiscale_hops}",
+            f"++lm.continuous_residual_multiscale_wins={multiscale_wins}",
 
             # ==== 2. 硬件加速（榨干性能，帮你省时间） ====
             "++dm.train_dataloader.num_workers=8",   # 开启多线程读数据，别让 GPU 等 CPU
@@ -239,6 +297,7 @@ if __name__ == "__main__":
             f"++lm.sad_rvq_freeze_main_model={str(args.sad_rvq_freeze_main_model).lower()}",
             f"++lm.sad_rvq_scheme_g_entropy_quantile={args.sad_rvq_scheme_g_entropy_quantile}",
             f"++lm.sad_rvq_scheme_h_min_temp={args.sad_rvq_scheme_h_min_temp}",
+            *([pretrained_ckpt_override] if pretrained_ckpt_override is not None else []),
         ],
         overwrite=args.reset_log_dir, wandb=False
     )
@@ -247,7 +306,21 @@ if __name__ == "__main__":
     ckpt_dir = project_root / "logs" / "addse-s-edbase-parallel60-a008-p02-spec" / "checkpoints"
     ckpts = list(ckpt_dir.glob("*.ckpt")) if ckpt_dir.exists() else []
     if ckpts:
-        best_ckpt = str(max(ckpts, key=lambda p: os.path.getmtime(p)))
+        def _parse_val_loss(path: Path) -> float | None:
+            m = re.search(r"val_loss=([0-9]+\.[0-9]+)", path.name)
+            return float(m.group(1)) if m else None
+
+        if args.eval_ckpt_policy == "last":
+            selected_ckpt = str(max(ckpts, key=lambda p: os.path.getmtime(p)))
+        else:
+            val_loss_ckpts = [(p, _parse_val_loss(p)) for p in ckpts]
+            val_loss_ckpts = [(p, v) for p, v in val_loss_ckpts if v is not None]
+            if val_loss_ckpts:
+                selected_ckpt = str(min(val_loss_ckpts, key=lambda x: x[1])[0])
+            else:
+                selected_ckpt = str(max(ckpts, key=lambda p: os.path.getmtime(p)))
+
+        best_ckpt = selected_ckpt
         print(f"--- 正在使用最佳权重进行评估: {best_ckpt} ---")
         eval_func(
             config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
@@ -256,7 +329,31 @@ if __name__ == "__main__":
                 f"lm.num_steps={args.eval_steps}",
                 f"lm.wave_residual_enabled={str((not args.disable_wave_residual)).lower()}",
                 f"eval.dsets.edbase-local.length={args.eval_examples}",
+                f"++eval_min_duration={args.eval_min_duration}",
                 f"lm.deterministic_eval={str(args.deterministic_eval).lower()}",
+                f"++lm.continuous_residual_train_only={str(args.continuous_residual_train_only).lower()}",
+                f"++lm.continuous_residual_joint_train={str(args.continuous_residual_joint_train).lower()}",
+                f"++lm.continuous_residual_lr_scale={args.continuous_residual_lr_scale}",
+                f"++lm.continuous_residual_backbone_lr_scale={args.continuous_residual_backbone_lr_scale}",
+                f"++lm.continuous_residual_probe_scale={args.continuous_residual_probe_scale}",
+                f"++lm.continuous_residual_init_bias={args.continuous_residual_init_bias}",
+                f"++lm.continuous_residual_zero_mean={str(args.continuous_residual_zero_mean).lower()}",
+                f"++lm.continuous_residual_warmup_steps={args.continuous_residual_warmup_steps}",
+                f"++lm.continuous_residual_warmup_weight={args.continuous_residual_warmup_weight}",
+                f"++lm.continuous_residual_warmup_residual_only={str(args.continuous_residual_warmup_residual_only).lower()}",
+                f"++lm.continuous_residual_warmup_mag_weight={args.continuous_residual_warmup_mag_weight}",
+                f"++lm.continuous_residual_warmup_phase_weight={args.continuous_residual_warmup_phase_weight}",
+                f"++lm.continuous_residual_warmup_stft_nfft={args.continuous_residual_warmup_stft_nfft}",
+                f"++lm.continuous_residual_warmup_stft_hop={args.continuous_residual_warmup_stft_hop}",
+                f"++lm.continuous_residual_warmup_stft_win={args.continuous_residual_warmup_stft_win}",
+                f"++lm.continuous_gain_margin={args.continuous_gain_margin}",
+                f"++lm.continuous_gain_penalty_weight={args.continuous_gain_penalty_weight}",
+                f"++lm.continuous_residual_use_multiscale_stft={str(args.continuous_residual_use_multiscale_stft).lower()}",
+                f"++lm.continuous_residual_predictor_channels={args.continuous_residual_predictor_channels}",
+                f"++lm.continuous_residual_predictor_blocks={args.continuous_residual_predictor_blocks}",
+                f"++lm.continuous_residual_multiscale_nffts={multiscale_nffts}",
+                f"++lm.continuous_residual_multiscale_hops={multiscale_hops}",
+                f"++lm.continuous_residual_multiscale_wins={multiscale_wins}",
                 f"++lm.sad_rvq_scheme={args.sad_rvq_scheme}",
                 f"++lm.sad_rvq_scheme_d_enabled={str(args.sad_rvq_scheme == 'd').lower()}",
                 f"++lm.sad_rvq_scheme_a_weight={args.sad_rvq_scheme_a_weight}",
@@ -301,10 +398,15 @@ if __name__ == "__main__":
                 f"++lm.sad_rvq_freeze_main_model={str(args.sad_rvq_freeze_main_model).lower()}",
                 f"++lm.sad_rvq_scheme_g_entropy_quantile={args.sad_rvq_scheme_g_entropy_quantile}",
                 f"++lm.sad_rvq_scheme_h_min_temp={args.sad_rvq_scheme_h_min_temp}",
+                *([pretrained_ckpt_override] if pretrained_ckpt_override is not None else []),
             ],
             output_dir=args.output_dir,
             output_db=args.output_db,
             num_examples=args.eval_examples,
+            eval_min_duration=args.eval_min_duration,
+            eval_min_active_duration=args.eval_min_active_duration,
+            eval_active_threshold=args.eval_active_threshold,
+            eval_seed=args.eval_seed,
             noisy=True,
             clean=True,
             device=args.device,
