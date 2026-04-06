@@ -619,7 +619,19 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             self._apply_continuous_residual_joint_train_requires_grad()
 
     def _is_continuous_residual_param(self, name: str) -> bool:
-        return "continuous_stft_encoder" in name or "continuous_stft_residual_predictor" in name
+        return any(
+            key in name
+            for key in (
+                "continuous_stft_encoder",
+                "continuous_stft_residual_predictor",
+                "continuous_stft_low_head",
+                "continuous_stft_high_head",
+                "continuous_stft_fusion_gate",
+                "wave_residual_net",
+                "wave_residual_low_head",
+                "wave_residual_high_head",
+            )
+        )
 
     def _apply_continuous_residual_train_only_requires_grad(self) -> None:
         for name, param in self.named_parameters():
@@ -643,12 +655,25 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     def _apply_continuous_residual_train_mode(self) -> None:
         if not (self.continuous_residual_train_only or self.continuous_residual_joint_train):
             return
-        # Keep frozen modules in eval mode to avoid train-time drift on the pretrained backbone.
-        self.eval()
-        if self.continuous_stft_encoder is not None:
-            self.continuous_stft_encoder.train()
-        if self.continuous_stft_residual_predictor is not None:
-            self.continuous_stft_residual_predictor.train()
+        # In branch-only training we keep the pretrained backbone in eval mode.
+        # In joint training the backbone must stay in train mode, otherwise
+        # discrete trunk optimization can be implicitly weakened.
+        if self.continuous_residual_train_only:
+            self.eval()
+        else:
+            super().train(True)
+        for module in (
+            self.continuous_stft_encoder,
+            self.continuous_stft_residual_predictor,
+            self.continuous_stft_low_head,
+            self.continuous_stft_high_head,
+            self.continuous_stft_fusion_gate,
+            self.wave_residual_net,
+            self.wave_residual_low_head,
+            self.wave_residual_high_head,
+        ):
+            if module is not None:
+                module.train()
 
     def on_train_start(self) -> None:
         self._apply_continuous_residual_train_mode()
