@@ -33,7 +33,7 @@ lm:
     gate_kernel_size: 3
     use_pitch_aware_gate: true
     pitch_gain: 0.2
-    interaction_on_logits: true
+    interaction_on_logits: false
     use_semantic_guidance: true
     use_snr_adaptive_gate: true
     use_interaction_alignment_gate: true

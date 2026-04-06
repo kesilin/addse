@@ -20,6 +20,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser("run_v33 short/full pipeline")
     parser.add_argument("--train-epochs", type=int, default=10)
     parser.add_argument("--train-batches", type=int, default=5)
+    parser.add_argument("--total-steps", type=int, default=0, help="If >0, override to single-epoch training with this many batches")
     parser.add_argument("--train-groups", type=int, default=150, help="Synthetic training groups / dataset length")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--train-shuffle", action="store_true", help="Enable train dataloader shuffle")
@@ -78,6 +79,12 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducible runs")
     parser.add_argument("--disable-pretrained-ckpt", action="store_true", help="Disable lm.pretrained_ckpt loading to avoid mismatch interference")
     parser.add_argument("--eval-ckpt-policy", type=str, default="best", choices=["best", "last"], help="Checkpoint policy for evaluation")
+    parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate with --checkpoint-path")
+    parser.add_argument("--checkpoint-path", type=str, default="", help="Checkpoint path used when --eval-only is enabled")
+    parser.add_argument("--force-discrete-only", action="store_true", help="Force discrete trunk only and disable continuous branch in inference/training path")
+    parser.add_argument("--late-fusion-cont-weight", type=float, default=1.0, help="Late-fusion weight applied to continuous residual branch")
+    parser.add_argument("--continuous-residual-discrete-prior-weight", type=float, default=0.3, help="Weight of discrete coarse prior injected into continuous branch input")
+    parser.add_argument("--continuous-residual-explicit-l1-weight", type=float, default=0.5, help="Explicit residual L1 supervision weight in continuous enhanced loss")
 
     # ===== SAD-RVQ Scheme Selection =====
     parser.add_argument("--sad-rvq-scheme", type=str, default="baseline", choices=["baseline", "a", "b", "c", "d", "e", "f", "g", "h"],
@@ -140,6 +147,38 @@ if __name__ == "__main__":
                        help="Auxiliary CE weight for first 3 codebooks in continuous residual mode")
     parser.add_argument("--sad-rvq-scheme-d-continuous-full-ce-weight", type=float, default=0.0,
                        help="Full discrete CE weight in continuous residual mode (for serial+parallel joint optimization)")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-loss-scale", type=float, default=1.0,
+                       help="Global scale for continuous coarse/enhanced SI-SDR primary loss")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stage1-epochs", type=int, default=0,
+                       help="Early epochs to prioritize discrete CE in continuous mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stage1-steps", "--stage1_steps", dest="sad_rvq_scheme_d_continuous_stage1_steps", type=int, default=0,
+                       help="Early train steps to prioritize discrete CE in continuous mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stage1-cont-weight-scale", type=float, default=0.6,
+                       help="Scale factor on continuous coarse/enhanced weights during stage1")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stage1-full-ce-scale", type=float, default=1.8,
+                       help="Scale factor on full CE weight during stage1")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stage1-front3-ce-scale", type=float, default=1.2,
+                       help="Scale factor on front3 CE weight during stage1")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stage1-freeze-continuous", action="store_true",
+                       help="Freeze continuous branch grads during stage1 to prioritize discrete trunk")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stage2-discrete-weight", type=float, default=0.7,
+                       help="Stage2 weight for discrete auxiliary CE loss in continuous mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-stage2-continuous-weight", type=float, default=0.3,
+                       help="Stage2 weight for continuous residual objectives in continuous mode")
+    parser.add_argument("--continuous-residual-discrete-grad-clip", type=float, default=1.0,
+                       help="Gradient clipping norm for discrete/backbone params in continuous training")
+    parser.add_argument("--continuous-residual-continuous-grad-clip", type=float, default=0.6,
+                       help="Gradient clipping norm for continuous branch params in continuous training")
+    parser.add_argument("--continuous-residual-grad-log-interval", type=int, default=20,
+                       help="Log interval (steps) for discrete/continuous gradient mean diagnostics")
+    parser.add_argument("--stage2-dis-weight", type=float, default=None,
+                       help="Alias of --sad-rvq-scheme-d-continuous-stage2-discrete-weight")
+    parser.add_argument("--stage2-cont-weight", type=float, default=None,
+                       help="Alias of --sad-rvq-scheme-d-continuous-stage2-continuous-weight")
+    parser.add_argument("--disable-logits-interaction", action="store_true", default=True,
+                       help="Force disable continuous branch interaction on discrete logits")
+    parser.add_argument("--enable-logits-interaction", action="store_true",
+                       help="Explicitly enable continuous branch interaction on discrete logits")
     parser.add_argument("--sad-rvq-scheme-d-continuous-coarse-source", type=str, default="front3", choices=["front3", "noisy"],
                        help="Coarse waveform source in continuous residual mode")
     parser.add_argument("--sad-rvq-scheme-d-continuous-dump-audio", action="store_true",
@@ -170,6 +209,18 @@ if __name__ == "__main__":
                        help="Minimum temperature for annealed routing (Scheme H)")
 
     args = parser.parse_args()
+
+    if args.total_steps > 0:
+        args.train_epochs = 1
+        args.train_batches = int(args.total_steps)
+
+    if args.stage2_dis_weight is not None:
+        args.sad_rvq_scheme_d_continuous_stage2_discrete_weight = float(args.stage2_dis_weight)
+    if args.stage2_cont_weight is not None:
+        args.sad_rvq_scheme_d_continuous_stage2_continuous_weight = float(args.stage2_cont_weight)
+
+    disable_logits_interaction = bool(args.disable_logits_interaction and not args.enable_logits_interaction)
+    print(f"--- logits交互状态: {str((not disable_logits_interaction)).lower()} ---")
 
     pretrained_ckpt_override = "++lm.pretrained_ckpt=null" if args.disable_pretrained_ckpt else None
     multiscale_nffts = [int(x) for x in args.continuous_residual_multiscale_nffts.split(",") if x.strip()]
@@ -204,9 +255,12 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision('high')
         print(f"--- ADDSE V3.3 进化实验 (主干保护版) ---")
 
-    train_func(
-        config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
-        overrides=[
+    selected_ckpt = ""
+
+    if not args.eval_only:
+        train_func(
+            config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
+            overrides=[
             # ==== 1. 训练轮次与数据量精准控制 ====
             f"++trainer.max_epochs={args.train_epochs}",
             f"++trainer.limit_train_batches={args.train_batches}",
@@ -246,6 +300,10 @@ if __name__ == "__main__":
             f"++lm.continuous_residual_warmup_stft_win={args.continuous_residual_warmup_stft_win}",
             f"++lm.continuous_gain_margin={args.continuous_gain_margin}",
             f"++lm.continuous_gain_penalty_weight={args.continuous_gain_penalty_weight}",
+            f"++lm.force_discrete_only={str(args.force_discrete_only).lower()}",
+            f"++lm.late_fusion_cont_weight={args.late_fusion_cont_weight}",
+            f"++lm.continuous_residual_discrete_prior_weight={args.continuous_residual_discrete_prior_weight}",
+            f"++lm.continuous_residual_explicit_l1_weight={args.continuous_residual_explicit_l1_weight}",
             f"++lm.continuous_residual_use_multiscale_stft={str(args.continuous_residual_use_multiscale_stft).lower()}",
             f"++lm.continuous_residual_predictor_channels={args.continuous_residual_predictor_channels}",
             f"++lm.continuous_residual_predictor_blocks={args.continuous_residual_predictor_blocks}",
@@ -300,6 +358,19 @@ if __name__ == "__main__":
             f"++lm.sad_rvq_scheme_d_continuous_enhanced_weight={args.sad_rvq_scheme_d_continuous_enhanced_weight}",
             f"++lm.sad_rvq_scheme_d_continuous_front3_ce_weight={args.sad_rvq_scheme_d_continuous_front3_ce_weight}",
             f"++lm.sad_rvq_scheme_d_continuous_full_ce_weight={args.sad_rvq_scheme_d_continuous_full_ce_weight}",
+            f"++lm.sad_rvq_scheme_d_continuous_loss_scale={args.sad_rvq_scheme_d_continuous_loss_scale}",
+            f"++lm.sad_rvq_scheme_d_continuous_stage1_epochs={args.sad_rvq_scheme_d_continuous_stage1_epochs}",
+            f"++lm.sad_rvq_scheme_d_continuous_stage1_steps={args.sad_rvq_scheme_d_continuous_stage1_steps}",
+            f"++lm.sad_rvq_scheme_d_continuous_stage1_cont_weight_scale={args.sad_rvq_scheme_d_continuous_stage1_cont_weight_scale}",
+            f"++lm.sad_rvq_scheme_d_continuous_stage1_full_ce_scale={args.sad_rvq_scheme_d_continuous_stage1_full_ce_scale}",
+            f"++lm.sad_rvq_scheme_d_continuous_stage1_front3_ce_scale={args.sad_rvq_scheme_d_continuous_stage1_front3_ce_scale}",
+            f"++lm.sad_rvq_scheme_d_continuous_stage1_freeze_continuous={str(args.sad_rvq_scheme_d_continuous_stage1_freeze_continuous).lower()}",
+            f"++lm.sad_rvq_scheme_d_continuous_stage2_discrete_weight={args.sad_rvq_scheme_d_continuous_stage2_discrete_weight}",
+            f"++lm.sad_rvq_scheme_d_continuous_stage2_continuous_weight={args.sad_rvq_scheme_d_continuous_stage2_continuous_weight}",
+            f"++lm.continuous_residual_discrete_grad_clip={args.continuous_residual_discrete_grad_clip}",
+            f"++lm.continuous_residual_continuous_grad_clip={args.continuous_residual_continuous_grad_clip}",
+            f"++lm.continuous_residual_grad_log_interval={args.continuous_residual_grad_log_interval}",
+            f"++lm.model.interaction_on_logits={str((not disable_logits_interaction)).lower()}",
             f"++lm.sad_rvq_scheme_d_continuous_coarse_source={args.sad_rvq_scheme_d_continuous_coarse_source}",
             f"++lm.sad_rvq_scheme_d_continuous_dump_audio={str(args.sad_rvq_scheme_d_continuous_dump_audio).lower()}",
             f"++lm.sad_rvq_scheme_d_continuous_use_stft_predictor={str(args.sad_rvq_scheme_d_continuous_use_stft_predictor).lower()}",
@@ -315,39 +386,54 @@ if __name__ == "__main__":
             f"++lm.sad_rvq_scheme_g_entropy_quantile={args.sad_rvq_scheme_g_entropy_quantile}",
             f"++lm.sad_rvq_scheme_h_min_temp={args.sad_rvq_scheme_h_min_temp}",
             *([pretrained_ckpt_override] if pretrained_ckpt_override is not None else []),
-        ],
-        overwrite=args.reset_log_dir, wandb=False
-    )
+            ],
+            overwrite=args.reset_log_dir, wandb=False
+        )
 
-    GlobalHydra.instance().clear() 
-    ckpt_dir = project_root / "logs" / "addse-s-edbase-parallel60-a008-p02-spec" / "checkpoints"
-    ckpts = list(ckpt_dir.glob("*.ckpt")) if ckpt_dir.exists() else []
-    if ckpts:
-        def _parse_val_loss(path: Path) -> float | None:
-            m = re.search(r"val_loss=([0-9]+\.[0-9]+)", path.name)
-            return float(m.group(1)) if m else None
+        GlobalHydra.instance().clear()
+        ckpt_dir = project_root / "logs" / "addse-s-edbase-parallel60-a008-p02-spec" / "checkpoints"
+        ckpts = list(ckpt_dir.glob("*.ckpt")) if ckpt_dir.exists() else []
+        if ckpts:
+            def _parse_val_loss(path: Path) -> float | None:
+                m = re.search(r"val_loss=([0-9]+\.[0-9]+)", path.name)
+                return float(m.group(1)) if m else None
 
-        if args.eval_ckpt_policy == "last":
-            selected_ckpt = str(max(ckpts, key=lambda p: os.path.getmtime(p)))
-        else:
-            val_loss_ckpts = [(p, _parse_val_loss(p)) for p in ckpts]
-            val_loss_ckpts = [(p, v) for p, v in val_loss_ckpts if v is not None]
-            if val_loss_ckpts:
-                selected_ckpt = str(min(val_loss_ckpts, key=lambda x: x[1])[0])
-            else:
+            if args.eval_ckpt_policy == "last":
                 selected_ckpt = str(max(ckpts, key=lambda p: os.path.getmtime(p)))
+            else:
+                val_loss_ckpts = [(p, _parse_val_loss(p)) for p in ckpts]
+                val_loss_ckpts = [(p, v) for p, v in val_loss_ckpts if v is not None]
+                if val_loss_ckpts:
+                    selected_ckpt = str(min(val_loss_ckpts, key=lambda x: x[1])[0])
+                else:
+                    selected_ckpt = str(max(ckpts, key=lambda p: os.path.getmtime(p)))
+        else:
+            print("--- 未找到 checkpoint，跳过评估。请检查 trainer 回调与验证频率。---")
+            sys.exit(1)
+    else:
+        selected_ckpt = args.checkpoint_path.strip()
+        if not selected_ckpt:
+            print("--- eval-only 模式需要提供 --checkpoint-path ---")
+            sys.exit(1)
+        if not os.path.exists(selected_ckpt):
+            print(f"--- checkpoint 不存在: {selected_ckpt} ---")
+            sys.exit(1)
+        print(f"--- eval-only: 使用指定 checkpoint 评估: {selected_ckpt} ---")
 
-        best_ckpt = selected_ckpt
-        print(f"--- 正在使用最佳权重进行评估: {best_ckpt} ---")
-        eval_func(
+    print(f"--- 正在使用权重进行评估: {selected_ckpt} ---")
+    eval_func(
             config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
-            checkpoint=best_ckpt,
+            checkpoint=selected_ckpt,
             overrides=[
                 f"lm.num_steps={args.eval_steps}",
                 f"lm.wave_residual_enabled={str((not args.disable_wave_residual)).lower()}",
                 f"eval.dsets.edbase-local.length={args.eval_examples}",
                 f"++eval_min_duration={args.eval_min_duration}",
                 f"lm.deterministic_eval={str(args.deterministic_eval).lower()}",
+                f"++lm.force_discrete_only={str(args.force_discrete_only).lower()}",
+                f"++lm.late_fusion_cont_weight={args.late_fusion_cont_weight}",
+                f"++lm.continuous_residual_discrete_prior_weight={args.continuous_residual_discrete_prior_weight}",
+                f"++lm.continuous_residual_explicit_l1_weight={args.continuous_residual_explicit_l1_weight}",
                 f"++lm.continuous_residual_train_only={str(args.continuous_residual_train_only).lower()}",
                 f"++lm.continuous_residual_joint_train={str(args.continuous_residual_joint_train).lower()}",
                 f"++lm.continuous_residual_lr_scale={args.continuous_residual_lr_scale}",
@@ -407,6 +493,19 @@ if __name__ == "__main__":
                 f"++lm.sad_rvq_scheme_d_continuous_enhanced_weight={args.sad_rvq_scheme_d_continuous_enhanced_weight}",
                 f"++lm.sad_rvq_scheme_d_continuous_front3_ce_weight={args.sad_rvq_scheme_d_continuous_front3_ce_weight}",
                 f"++lm.sad_rvq_scheme_d_continuous_full_ce_weight={args.sad_rvq_scheme_d_continuous_full_ce_weight}",
+                f"++lm.sad_rvq_scheme_d_continuous_loss_scale={args.sad_rvq_scheme_d_continuous_loss_scale}",
+                f"++lm.sad_rvq_scheme_d_continuous_stage1_epochs={args.sad_rvq_scheme_d_continuous_stage1_epochs}",
+                f"++lm.sad_rvq_scheme_d_continuous_stage1_steps={args.sad_rvq_scheme_d_continuous_stage1_steps}",
+                f"++lm.sad_rvq_scheme_d_continuous_stage1_cont_weight_scale={args.sad_rvq_scheme_d_continuous_stage1_cont_weight_scale}",
+                f"++lm.sad_rvq_scheme_d_continuous_stage1_full_ce_scale={args.sad_rvq_scheme_d_continuous_stage1_full_ce_scale}",
+                f"++lm.sad_rvq_scheme_d_continuous_stage1_front3_ce_scale={args.sad_rvq_scheme_d_continuous_stage1_front3_ce_scale}",
+                f"++lm.sad_rvq_scheme_d_continuous_stage1_freeze_continuous={str(args.sad_rvq_scheme_d_continuous_stage1_freeze_continuous).lower()}",
+                f"++lm.sad_rvq_scheme_d_continuous_stage2_discrete_weight={args.sad_rvq_scheme_d_continuous_stage2_discrete_weight}",
+                f"++lm.sad_rvq_scheme_d_continuous_stage2_continuous_weight={args.sad_rvq_scheme_d_continuous_stage2_continuous_weight}",
+                f"++lm.continuous_residual_discrete_grad_clip={args.continuous_residual_discrete_grad_clip}",
+                f"++lm.continuous_residual_continuous_grad_clip={args.continuous_residual_continuous_grad_clip}",
+                f"++lm.continuous_residual_grad_log_interval={args.continuous_residual_grad_log_interval}",
+                f"++lm.model.interaction_on_logits={str((not disable_logits_interaction)).lower()}",
                 f"++lm.sad_rvq_scheme_d_continuous_coarse_source={args.sad_rvq_scheme_d_continuous_coarse_source}",
                 f"++lm.sad_rvq_scheme_d_continuous_dump_audio={str(args.sad_rvq_scheme_d_continuous_dump_audio).lower()}",
                 f"++lm.sad_rvq_scheme_d_continuous_use_stft_predictor={str(args.sad_rvq_scheme_d_continuous_use_stft_predictor).lower()}",
@@ -436,5 +535,3 @@ if __name__ == "__main__":
             overwrite=True,
             num_consumers=0,
         )
-    else:
-        print("--- 未找到 checkpoint，跳过评估。请检查 trainer 回调与验证频率。---")

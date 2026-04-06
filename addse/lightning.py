@@ -356,6 +356,36 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.sad_rvq_scheme_d_continuous_enhanced_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_enhanced_weight", 1.0))
         self.sad_rvq_scheme_d_continuous_front3_ce_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_front3_ce_weight", 1.0))
         self.sad_rvq_scheme_d_continuous_full_ce_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_full_ce_weight", 0.0))
+        self.sad_rvq_scheme_d_continuous_loss_scale = float(kwargs.get("sad_rvq_scheme_d_continuous_loss_scale", 1.0))
+        self.sad_rvq_scheme_d_continuous_stage1_epochs = int(kwargs.get("sad_rvq_scheme_d_continuous_stage1_epochs", 0))
+        self.sad_rvq_scheme_d_continuous_stage1_steps = int(kwargs.get("sad_rvq_scheme_d_continuous_stage1_steps", 0))
+        self.sad_rvq_scheme_d_continuous_stage1_cont_weight_scale = float(
+            kwargs.get("sad_rvq_scheme_d_continuous_stage1_cont_weight_scale", 0.6)
+        )
+        self.sad_rvq_scheme_d_continuous_stage1_full_ce_scale = float(
+            kwargs.get("sad_rvq_scheme_d_continuous_stage1_full_ce_scale", 1.8)
+        )
+        self.sad_rvq_scheme_d_continuous_stage1_front3_ce_scale = float(
+            kwargs.get("sad_rvq_scheme_d_continuous_stage1_front3_ce_scale", 1.2)
+        )
+        self.sad_rvq_scheme_d_continuous_stage1_freeze_continuous = bool(
+            kwargs.get("sad_rvq_scheme_d_continuous_stage1_freeze_continuous", True)
+        )
+        self.sad_rvq_scheme_d_continuous_stage2_discrete_weight = float(
+            kwargs.get("sad_rvq_scheme_d_continuous_stage2_discrete_weight", 0.7)
+        )
+        self.sad_rvq_scheme_d_continuous_stage2_continuous_weight = float(
+            kwargs.get("sad_rvq_scheme_d_continuous_stage2_continuous_weight", 0.3)
+        )
+        self.continuous_residual_discrete_grad_clip = float(
+            kwargs.get("continuous_residual_discrete_grad_clip", 1.0)
+        )
+        self.continuous_residual_continuous_grad_clip = float(
+            kwargs.get("continuous_residual_continuous_grad_clip", 0.6)
+        )
+        self.continuous_residual_grad_log_interval = int(
+            kwargs.get("continuous_residual_grad_log_interval", 20)
+        )
         self.sad_rvq_scheme_d_continuous_coarse_source = str(kwargs.get("sad_rvq_scheme_d_continuous_coarse_source", "front3")).lower()
         self.sad_rvq_scheme_d_continuous_dump_audio = bool(kwargs.get("sad_rvq_scheme_d_continuous_dump_audio", False))
         self.sad_rvq_scheme_d_continuous_use_stft_predictor = bool(kwargs.get("sad_rvq_scheme_d_continuous_use_stft_predictor", False))
@@ -402,6 +432,14 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.continuous_residual_warmup_stft_win = int(kwargs.get("continuous_residual_warmup_stft_win", 512))
         self.continuous_gain_margin = float(kwargs.get("continuous_gain_margin", 0.0))
         self.continuous_gain_penalty_weight = float(kwargs.get("continuous_gain_penalty_weight", 0.0))
+        self.force_discrete_only = bool(kwargs.get("force_discrete_only", False))
+        self.continuous_residual_discrete_prior_weight = float(
+            kwargs.get("continuous_residual_discrete_prior_weight", 0.3)
+        )
+        self.continuous_residual_explicit_l1_weight = float(
+            kwargs.get("continuous_residual_explicit_l1_weight", 0.5)
+        )
+        self.late_fusion_cont_weight = float(kwargs.get("late_fusion_cont_weight", 1.0))
         self.continuous_stft_encoder: nn.Module | None = None
         self.continuous_stft_residual_predictor: nn.Module | None = None
         self.continuous_stft_low_head: nn.Conv1d | None = None
@@ -644,6 +682,28 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         for name, param in self.named_parameters():
             param.requires_grad = self._is_continuous_residual_param(name) or self._is_continuous_residual_backbone_param(name)
 
+    def _is_continuous_stage1(self) -> bool:
+        stage1_steps = int(self.sad_rvq_scheme_d_continuous_stage1_steps)
+        if stage1_steps > 0:
+            return self.training and int(getattr(self, "global_step", 0)) < stage1_steps
+        return (
+            self.training
+            and self.sad_rvq_scheme_d_continuous_stage1_epochs > 0
+            and int(getattr(self, "current_epoch", 0)) < self.sad_rvq_scheme_d_continuous_stage1_epochs
+        )
+
+    def _apply_continuous_stage_requires_grad(self) -> None:
+        if not self.continuous_residual_joint_train:
+            return
+        if self._is_continuous_stage1() and self.sad_rvq_scheme_d_continuous_stage1_freeze_continuous:
+            for name, param in self.named_parameters():
+                if self._is_continuous_residual_param(name):
+                    param.requires_grad = False
+                elif self._is_continuous_residual_backbone_param(name):
+                    param.requires_grad = True
+        else:
+            self._apply_continuous_residual_joint_train_requires_grad()
+
     def _get_base_optimizer_lr(self) -> float:
         opt = self.optimizer
         if hasattr(opt, "keywords") and isinstance(opt.keywords, dict) and opt.keywords.get("lr") is not None:
@@ -676,10 +736,45 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 module.train()
 
     def on_train_start(self) -> None:
+        self._apply_continuous_stage_requires_grad()
         self._apply_continuous_residual_train_mode()
 
     def on_train_epoch_start(self) -> None:
+        self._apply_continuous_stage_requires_grad()
         self._apply_continuous_residual_train_mode()
+
+    def on_train_batch_start(self, batch: Any, batch_idx: int) -> None:
+        self._apply_continuous_stage_requires_grad()
+
+    def on_after_backward(self) -> None:
+        if not (self.continuous_residual_train_only or self.continuous_residual_joint_train):
+            return
+
+        discrete_params: list[nn.Parameter] = []
+        continuous_params: list[nn.Parameter] = []
+        for name, param in self.named_parameters():
+            if param.grad is None:
+                continue
+            if self._is_continuous_residual_param(name):
+                continuous_params.append(param)
+            elif self._is_continuous_residual_backbone_param(name):
+                discrete_params.append(param)
+
+        if self.continuous_residual_discrete_grad_clip > 0 and discrete_params:
+            torch.nn.utils.clip_grad_norm_(discrete_params, max_norm=self.continuous_residual_discrete_grad_clip)
+        if self.continuous_residual_continuous_grad_clip > 0 and continuous_params:
+            torch.nn.utils.clip_grad_norm_(continuous_params, max_norm=self.continuous_residual_continuous_grad_clip)
+
+        interval = max(1, int(self.continuous_residual_grad_log_interval))
+        if int(getattr(self, "global_step", 0)) % interval != 0:
+            return
+
+        if discrete_params:
+            discrete_grad_mean = torch.stack([p.grad.detach().abs().mean() for p in discrete_params]).mean()
+            self.log("train/grad_discrete_mean_abs", discrete_grad_mean, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
+        if continuous_params:
+            continuous_grad_mean = torch.stack([p.grad.detach().abs().mean() for p in continuous_params]).mean()
+            self.log("train/grad_continuous_mean_abs", continuous_grad_mean, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True)
 
     def train(self, mode: bool = True) -> "ADDSELightningModule":
         super().train(mode)
@@ -1186,7 +1281,8 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         min_len = min(noisy_wave.shape[-1], base_wave.shape[-1])
         noisy_mono = noisy_wave[..., :min_len].squeeze(1)
         base_mono = base_wave[..., :min_len].squeeze(1)
-        residual_mono = noisy_mono - base_mono
+        cont_input_mono = noisy_mono + self.continuous_residual_discrete_prior_weight * base_mono
+        residual_mono = cont_input_mono - base_mono
 
         if isinstance(self.continuous_stft_encoder, nn.ModuleList):
             encoder_scales = list(self.continuous_stft_encoder)
@@ -1204,7 +1300,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         for encoder, n_fft, hop_length, win_length in zip(encoder_scales, nffts, hops, wins):
             stft_window = torch.hann_window(win_length, device=noisy_mono.device, dtype=noisy_mono.dtype)
             noisy_stft = torch.stft(
-                noisy_mono,
+                cont_input_mono,
                 n_fft=n_fft,
                 hop_length=hop_length,
                 win_length=win_length,
@@ -1268,6 +1364,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             branch_wave = branch_wave - branch_wave.mean(dim=-1, keepdim=True)
         if self.continuous_residual_probe_scale != 1.0:
             branch_wave = branch_wave * float(self.continuous_residual_probe_scale)
+        branch_wave = branch_wave * float(self.late_fusion_cont_weight)
 
         if self.continuous_residual_direct_clean_target:
             enhanced_wave = branch_wave
@@ -1291,6 +1388,12 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 matched += 1
         if matched == 0:
             raise ValueError(f"No model parameters matched trainable_param_patterns: {normalized}")
+
+    def _build_continuous_branch_input(self, noisy_wave: Tensor, base_wave: Tensor) -> Tensor:
+        min_len = min(noisy_wave.shape[-1], base_wave.shape[-1])
+        noisy = noisy_wave[..., :min_len]
+        base = base_wave[..., :min_len]
+        return noisy + self.continuous_residual_discrete_prior_weight * base
 
     def log_score(self, y_q, x_q, x_cont=None, return_raw_logits: bool = False):
         x_c_in = x_cont if x_cont is not None else torch.zeros_like(x_q)
@@ -1503,7 +1606,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         log_p, residual_pred, quality_pred, logits_raw = self.log_score(y_lambda_q, x_q, x_cont=x_lat, return_raw_logits=True)
         logits_for_ce = logits_raw
 
-        if self.sad_rvq_scheme_d_continuous_residual_mode:
+        if self.sad_rvq_scheme_d_continuous_residual_mode and not self.force_discrete_only:
             if not self.wave_residual_enabled and not self.sad_rvq_scheme_d_continuous_use_stft_predictor:
                 raise RuntimeError("Continuous residual mode requires wave_residual_enabled=true or continuous_use_stft_predictor=true")
 
@@ -1523,10 +1626,11 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                         coarse_lat = coarse_lat.sum(dim=2)
                 coarse_wave = self._decode_latent_to_wave(coarse_lat.detach(), target_length=y.shape[-1])
 
+            cont_input_wave = self._build_continuous_branch_input(x[..., : y.shape[-1]], coarse_wave)
             if self.sad_rvq_scheme_d_continuous_use_stft_predictor:
-                enhanced_wave, wave_delta = self._predict_stft_wave_residual(x[..., : y.shape[-1]], coarse_wave)
+                enhanced_wave, wave_delta = self._predict_stft_wave_residual(cont_input_wave, coarse_wave)
             else:
-                enhanced_wave, wave_delta = self._predict_wave_residual(x, coarse_wave, None)
+                enhanced_wave, wave_delta = self._predict_wave_residual(cont_input_wave, coarse_wave, None)
 
             min_len = min(coarse_wave.shape[-1], enhanced_wave.shape[-1], y.shape[-1])
             coarse_wave = coarse_wave[..., :min_len]
@@ -1534,20 +1638,51 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             y_target = y[..., :min_len]
 
             loss_coarse = self._si_sdr_loss(coarse_wave, y_target)
-            loss_enhanced = self._si_sdr_loss(enhanced_wave, y_target)
+            loss_enhanced_si_sdr = self._si_sdr_loss(enhanced_wave, y_target)
+            pred_residual = enhanced_wave - coarse_wave
+            target_residual = (y_target - coarse_wave).detach()
+            cont_loss_residual = F.l1_loss(pred_residual, target_residual)
+            loss_enhanced = loss_enhanced_si_sdr + self.continuous_residual_explicit_l1_weight * cont_loss_residual
             noisy_si_sdr_loss = self._si_sdr_loss(x[..., :min_len], y_target)
             gain_vs_noisy = noisy_si_sdr_loss - loss_enhanced
             global_step = int(getattr(self.trainer, "global_step", 0))
+            epoch_idx = int(getattr(self, "current_epoch", 0))
+            if int(self.sad_rvq_scheme_d_continuous_stage1_steps) > 0:
+                in_stage1 = stage == "train" and global_step < int(self.sad_rvq_scheme_d_continuous_stage1_steps)
+            else:
+                in_stage1 = (
+                    stage == "train"
+                    and self.sad_rvq_scheme_d_continuous_stage1_epochs > 0
+                    and epoch_idx < self.sad_rvq_scheme_d_continuous_stage1_epochs
+                )
             in_warmup = stage == "train" and self.continuous_residual_warmup_steps > 0 and global_step < self.continuous_residual_warmup_steps
-            total_loss = (
-                self.sad_rvq_scheme_d_continuous_coarse_weight * loss_coarse
-                + self.sad_rvq_scheme_d_continuous_enhanced_weight * loss_enhanced
+            warmup_residual_only = self.continuous_residual_warmup_residual_only and not (
+                in_stage1 and self.sad_rvq_scheme_d_continuous_stage1_freeze_continuous
             )
 
+            coarse_weight = self.sad_rvq_scheme_d_continuous_coarse_weight
+            enhanced_weight = self.sad_rvq_scheme_d_continuous_enhanced_weight
+            front3_ce_weight = self.sad_rvq_scheme_d_continuous_front3_ce_weight
+            full_ce_weight = self.sad_rvq_scheme_d_continuous_full_ce_weight
+
+            if in_stage1:
+                cont_scale = max(self.sad_rvq_scheme_d_continuous_stage1_cont_weight_scale, 0.0)
+                coarse_weight = coarse_weight * cont_scale
+                enhanced_weight = enhanced_weight * cont_scale
+                front3_ce_weight = front3_ce_weight * max(self.sad_rvq_scheme_d_continuous_stage1_front3_ce_scale, 0.0)
+                full_ce_weight = full_ce_weight * max(self.sad_rvq_scheme_d_continuous_stage1_full_ce_scale, 0.0)
+
+            total_loss = (
+                coarse_weight * loss_coarse
+                + enhanced_weight * loss_enhanced
+            )
+            total_loss = self.sad_rvq_scheme_d_continuous_loss_scale * total_loss
+            discrete_aux_loss = torch.tensor(0.0, device=total_loss.device, dtype=total_loss.dtype)
+
             if (
-                self.sad_rvq_scheme_d_continuous_front3_ce_weight > 0
+                front3_ce_weight > 0
                 and front_books > 0
-                and not (in_warmup and self.continuous_residual_warmup_residual_only)
+                and not (in_warmup and warmup_residual_only)
             ):
                 mask_front = mask[:, :front_books, :]
                 front_ce = F.cross_entropy(
@@ -1556,21 +1691,25 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                     reduction="none",
                 ).reshape(B, front_books, L)
                 front_ce = (front_ce * mask_front).sum() / (mask_front.sum() + 1e-8)
-                total_loss = total_loss + self.sad_rvq_scheme_d_continuous_front3_ce_weight * front_ce
+                total_loss = total_loss + front3_ce_weight * front_ce
+                discrete_aux_loss = discrete_aux_loss + front3_ce_weight * front_ce
                 self.log(f"{stage}/cont_front3_ce", front_ce, prog_bar=True, sync_dist=True)
 
-            if self.sad_rvq_scheme_d_continuous_full_ce_weight > 0 and not (in_warmup and self.continuous_residual_warmup_residual_only):
+            if full_ce_weight > 0 and not (in_warmup and warmup_residual_only):
                 full_ce_per_token = F.cross_entropy(
                     logits_for_ce.reshape(-1, V),
                     y_tok.reshape(-1),
                     reduction="none",
                 ).reshape(B, K, L)
                 full_ce = (full_ce_per_token * mask).sum() / (mask.sum() + 1e-8)
-                total_loss = total_loss + self.sad_rvq_scheme_d_continuous_full_ce_weight * full_ce
+                total_loss = total_loss + full_ce_weight * full_ce
+                discrete_aux_loss = discrete_aux_loss + full_ce_weight * full_ce
                 self.log(f"{stage}/cont_full_ce", full_ce, prog_bar=True, sync_dist=True)
 
             self.log(f"{stage}/cont_loss_coarse", loss_coarse, prog_bar=True, sync_dist=True)
             self.log(f"{stage}/cont_loss_enhanced", loss_enhanced, prog_bar=True, sync_dist=True)
+            self.log(f"{stage}/cont_loss_enhanced_si_sdr", loss_enhanced_si_sdr, prog_bar=False, sync_dist=True)
+            self.log(f"{stage}/cont_loss_residual_l1", cont_loss_residual, prog_bar=False, sync_dist=True)
             self.log(f"{stage}/cont_loss_noisy", noisy_si_sdr_loss, prog_bar=True, sync_dist=True)
             self.log(f"{stage}/cont_gain_vs_noisy", gain_vs_noisy, prog_bar=True, sync_dist=True)
 
@@ -1594,10 +1733,25 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                         warmup_total = warmup_total + self.continuous_residual_warmup_phase_weight * warmup_phase
                         self.log(f"{stage}/cont_warmup_phase", warmup_phase, prog_bar=True, sync_dist=True)
 
-                if self.continuous_residual_warmup_residual_only:
+                if warmup_residual_only:
                     total_loss = warmup_total
                 else:
-                    total_loss = self.sad_rvq_scheme_d_continuous_coarse_weight * loss_coarse + warmup_total
+                    total_loss = total_loss + warmup_total
+
+            if stage == "train" and not in_warmup:
+                has_discrete_aux = bool(discrete_aux_loss.detach().abs().item() > 0.0)
+                if in_stage1 and self.sad_rvq_scheme_d_continuous_stage1_freeze_continuous and has_discrete_aux:
+                    total_loss = discrete_aux_loss
+                elif has_discrete_aux:
+                    discrete_w = max(self.sad_rvq_scheme_d_continuous_stage2_discrete_weight, 0.0)
+                    continuous_w = max(self.sad_rvq_scheme_d_continuous_stage2_continuous_weight, 0.0)
+                    continuous_part = total_loss - discrete_aux_loss
+                    total_loss = discrete_w * discrete_aux_loss + continuous_w * continuous_part
+                    self.log(f"{stage}/cont_stage2_discrete_w", torch.tensor(discrete_w, device=total_loss.device), prog_bar=False, sync_dist=True)
+                    self.log(f"{stage}/cont_stage2_cont_w", torch.tensor(continuous_w, device=total_loss.device), prog_bar=False, sync_dist=True)
+
+            if stage == "train":
+                self.log(f"{stage}/cont_in_stage1", torch.tensor(1.0 if in_stage1 else 0.0, device=total_loss.device), prog_bar=False, sync_dist=True)
 
             if not in_warmup and self.continuous_gain_penalty_weight > 0 and self.continuous_gain_margin > 0:
                 gain_penalty = F.relu(self.continuous_gain_margin - gain_vs_noisy)
@@ -1662,7 +1816,9 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
             if metrics or (stage == "val" and batch_idx == 0):
                 solve_out = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat, x_wave=x)
-                if self.sad_rvq_scheme_d_continuous_use_stft_predictor or self.wave_residual_enabled:
+                if self.force_discrete_only:
+                    y_hat = solve_out if solve_out.ndim == 3 and solve_out.shape[1] == 1 else self._decode_latent_to_wave(solve_out, target_length=y.shape[-1])
+                elif self.sad_rvq_scheme_d_continuous_use_stft_predictor or self.wave_residual_enabled:
                     y_hat = solve_out
                 else:
                     y_lat_fused = solve_out
@@ -2077,7 +2233,9 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
         if metrics or (stage == "val" and batch_idx == 0):
             solve_out = self.solve(x_tok, x_q, self.num_steps, x_cont=x_lat, x_wave=x)
-            if self.wave_residual_enabled:
+            if self.force_discrete_only:
+                y_hat = solve_out if solve_out.ndim == 3 and solve_out.shape[1] == 1 else self._decode_latent_to_wave(solve_out, target_length=y.shape[-1])
+            elif self.wave_residual_enabled:
                 y_hat = solve_out
             else:
                 y_lat_fused = solve_out
@@ -2157,17 +2315,24 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         if y_q_discrete.ndim == 4:
             y_q_discrete = y_q_discrete.sum(dim=1) if y_q_discrete.shape[1] == K else y_q_discrete.sum(dim=2)
 
+        if self.force_discrete_only:
+            if x_wave is not None:
+                return self._decode_latent_to_wave(y_q_discrete, target_length=x_wave.shape[-1])
+            return y_q_discrete
+
         if x_wave is not None and self.sad_rvq_scheme_d_continuous_residual_mode and self.sad_rvq_scheme_d_continuous_use_stft_predictor:
             if self.sad_rvq_scheme_d_continuous_coarse_source == "noisy":
                 base_wave = x_wave[..., : x_wave.shape[-1]]
             else:
                 base_wave = self._decode_latent_to_wave(y_q_discrete, target_length=x_wave.shape[-1])
-            wave_fused, _ = self._predict_stft_wave_residual(x_wave[..., : base_wave.shape[-1]], base_wave)
+            cont_input_wave = self._build_continuous_branch_input(x_wave[..., : base_wave.shape[-1]], base_wave)
+            wave_fused, _ = self._predict_stft_wave_residual(cont_input_wave, base_wave)
             return wave_fused[..., : x_wave.shape[-1]]
 
         if self.wave_residual_enabled and x_wave is not None:
             base_wave = self._decode_latent_to_wave(y_q_discrete, target_length=x_wave.shape[-1])
-            wave_fused, _ = self._predict_wave_residual(x_wave, base_wave, final_residual)
+            cont_input_wave = self._build_continuous_branch_input(x_wave, base_wave)
+            wave_fused, _ = self._predict_wave_residual(cont_input_wave, base_wave, final_residual)
             return wave_fused[..., : x_wave.shape[-1]]
 
         if isinstance(final_residual, Tensor) and self.fidelity_gate_enabled:
