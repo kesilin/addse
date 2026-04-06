@@ -145,6 +145,51 @@ class TemporalResidualBlock(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return x + self.net(x)
 
+
+class AtrousTemporalPyramid(nn.Module):
+    def __init__(self, channels: int, dilation_rates: tuple[int, ...] = (1, 2, 4, 8), kernel_size: int = 3) -> None:
+        super().__init__()
+        dilation_rates = tuple(int(rate) for rate in dilation_rates if int(rate) > 0)
+        if not dilation_rates:
+            raise ValueError("AtrousTemporalPyramid requires at least one positive dilation rate")
+        self.branches = nn.ModuleList()
+        for dilation in dilation_rates:
+            padding = dilation * (kernel_size - 1) // 2
+            self.branches.append(
+                nn.Sequential(
+                    nn.Conv1d(channels, channels, kernel_size=1),
+                    nn.GELU(),
+                    nn.Conv1d(
+                        channels,
+                        channels,
+                        kernel_size=kernel_size,
+                        padding=padding,
+                        dilation=dilation,
+                        groups=channels,
+                    ),
+                    nn.GELU(),
+                    nn.Conv1d(channels, channels, kernel_size=1),
+                )
+            )
+        self.context = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(channels, channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv1d(channels * (len(dilation_rates) + 2), channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv1d(channels, channels, kernel_size=1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        branch_outs = [branch(x) for branch in self.branches]
+        context = self.context(x)
+        context = context.expand(-1, -1, x.shape[-1])
+        fused = torch.cat([x, *branch_outs, context], dim=1)
+        return x + self.fuse(fused)
+
 @dataclass
 class LogConfig:
     on_train_step: bool = False
@@ -310,6 +355,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.sad_rvq_scheme_d_continuous_coarse_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_coarse_weight", 0.3))
         self.sad_rvq_scheme_d_continuous_enhanced_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_enhanced_weight", 1.0))
         self.sad_rvq_scheme_d_continuous_front3_ce_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_front3_ce_weight", 1.0))
+        self.sad_rvq_scheme_d_continuous_full_ce_weight = float(kwargs.get("sad_rvq_scheme_d_continuous_full_ce_weight", 0.0))
         self.sad_rvq_scheme_d_continuous_coarse_source = str(kwargs.get("sad_rvq_scheme_d_continuous_coarse_source", "front3")).lower()
         self.sad_rvq_scheme_d_continuous_dump_audio = bool(kwargs.get("sad_rvq_scheme_d_continuous_dump_audio", False))
         self.sad_rvq_scheme_d_continuous_use_stft_predictor = bool(kwargs.get("sad_rvq_scheme_d_continuous_use_stft_predictor", False))
@@ -325,6 +371,20 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.continuous_residual_multiscale_wins = tuple(kwargs.get("continuous_residual_multiscale_wins", (512, 1024, 2048)))
         self.continuous_residual_predictor_channels = int(kwargs.get("continuous_residual_predictor_channels", 256))
         self.continuous_residual_predictor_blocks = int(kwargs.get("continuous_residual_predictor_blocks", 3))
+        self.continuous_residual_predictor_dilation_rates = tuple(
+            int(rate)
+            for rate in kwargs.get("continuous_residual_predictor_dilation_rates", (1, 2, 4, 8))
+            if int(rate) > 0
+        )
+        self.continuous_residual_stft_low_stride = int(kwargs.get("continuous_residual_stft_low_stride", 8))
+        self.continuous_residual_stft_input_mode = str(
+            kwargs.get("continuous_residual_stft_input_mode", "noisy")
+        ).lower()
+        self.continuous_residual_direct_clean_target = bool(
+            kwargs.get("continuous_residual_direct_clean_target", False)
+        )
+        self.continuous_branch_wave_l1_weight = float(kwargs.get("continuous_branch_wave_l1_weight", 0.0))
+        self.continuous_branch_si_sdr_weight = float(kwargs.get("continuous_branch_si_sdr_weight", 0.0))
         self.continuous_residual_train_only = bool(kwargs.get("continuous_residual_train_only", False))
         self.continuous_residual_joint_train = bool(kwargs.get("continuous_residual_joint_train", False))
         self.continuous_residual_lr_scale = float(kwargs.get("continuous_residual_lr_scale", 3.0))
@@ -344,15 +404,19 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.continuous_gain_penalty_weight = float(kwargs.get("continuous_gain_penalty_weight", 0.0))
         self.continuous_stft_encoder: nn.Module | None = None
         self.continuous_stft_residual_predictor: nn.Module | None = None
+        self.continuous_stft_low_head: nn.Conv1d | None = None
+        self.continuous_stft_high_head: nn.Conv1d | None = None
+        self.continuous_stft_fusion_gate: nn.Module | None = None
         self.sad_rvq_scheme_train_mode = str(kwargs.get("sad_rvq_scheme_train_mode", "normal")).lower()
         self.sad_rvq_freeze_main_model = bool(kwargs.get("sad_rvq_freeze_main_model", False))
 
         if self.sad_rvq_scheme_d_continuous_use_stft_predictor:
             encoder_scales = len(self.continuous_residual_multiscale_nffts) if self.continuous_residual_use_multiscale_stft else 1
+            stft_input_channels = 6 if self.continuous_residual_stft_input_mode == "noisy_base_residual" else 2
             self.continuous_stft_encoder = nn.ModuleList(
                 [
                     nn.Sequential(
-                        nn.Conv2d(2, 32, kernel_size=3, padding=1),
+                        nn.Conv2d(stft_input_channels, 32, kernel_size=3, padding=1),
                         nn.GELU(),
                         nn.Conv2d(32, 64, kernel_size=3, padding=1),
                         nn.GELU(),
@@ -366,6 +430,11 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             predictor_layers: list[nn.Module] = [
                 nn.Conv1d(fusion_in_channels, predictor_channels, kernel_size=1),
                 nn.GELU(),
+                AtrousTemporalPyramid(
+                    predictor_channels,
+                    dilation_rates=self.continuous_residual_predictor_dilation_rates,
+                    kernel_size=3,
+                ),
             ]
             for idx in range(predictor_blocks):
                 predictor_layers.append(TemporalResidualBlock(predictor_channels, kernel_size=3, dilation=2 ** idx))
@@ -382,6 +451,20 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 if isinstance(last, nn.Conv1d) and last.bias is not None:
                     with torch.no_grad():
                         last.bias.fill_(self.continuous_residual_init_bias)
+            self.continuous_stft_low_head = nn.Conv1d(1, 1, kernel_size=1)
+            self.continuous_stft_high_head = nn.Conv1d(1, 1, kernel_size=1)
+            self.continuous_stft_fusion_gate = nn.Sequential(
+                nn.AdaptiveAvgPool1d(1),
+                nn.Conv1d(1, 1, kernel_size=1),
+            )
+            nn.init.zeros_(self.continuous_stft_low_head.weight)
+            nn.init.zeros_(self.continuous_stft_low_head.bias)
+            nn.init.zeros_(self.continuous_stft_high_head.weight)
+            nn.init.zeros_(self.continuous_stft_high_head.bias)
+            gate_last = self.continuous_stft_fusion_gate[-1]
+            if isinstance(gate_last, nn.Conv1d):
+                nn.init.zeros_(gate_last.weight)
+                nn.init.zeros_(gate_last.bias)
         
         # Scheme D: Initialize learnable router
         scheme_with_acoustic = self.sad_rvq_scheme in {"d", "e", "f", "g", "h"} or self.sad_rvq_scheme_d_enabled
@@ -1075,7 +1158,10 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
     def _predict_stft_wave_residual(self, noisy_wave: Tensor, base_wave: Tensor) -> tuple[Tensor, Tensor]:
         if self.continuous_stft_encoder is None or self.continuous_stft_residual_predictor is None:
             raise RuntimeError("continuous STFT predictor is not initialized")
-        noisy_mono = noisy_wave.squeeze(1)
+        min_len = min(noisy_wave.shape[-1], base_wave.shape[-1])
+        noisy_mono = noisy_wave[..., :min_len].squeeze(1)
+        base_mono = base_wave[..., :min_len].squeeze(1)
+        residual_mono = noisy_mono - base_mono
 
         if isinstance(self.continuous_stft_encoder, nn.ModuleList):
             encoder_scales = list(self.continuous_stft_encoder)
@@ -1100,8 +1186,38 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 window=stft_window,
                 return_complex=True,
             )
-            noisy_stft_ri = torch.stack([noisy_stft.real, noisy_stft.imag], dim=1)
-            encoded = encoder(noisy_stft_ri).mean(dim=2)
+            if self.continuous_residual_stft_input_mode == "noisy_base_residual":
+                base_stft = torch.stft(
+                    base_mono,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    win_length=win_length,
+                    window=stft_window,
+                    return_complex=True,
+                )
+                residual_stft = torch.stft(
+                    residual_mono,
+                    n_fft=n_fft,
+                    hop_length=hop_length,
+                    win_length=win_length,
+                    window=stft_window,
+                    return_complex=True,
+                )
+                stft_input = torch.stack(
+                    [
+                        noisy_stft.real,
+                        noisy_stft.imag,
+                        base_stft.real,
+                        base_stft.imag,
+                        residual_stft.real,
+                        residual_stft.imag,
+                    ],
+                    dim=1,
+                )
+            else:
+                stft_input = torch.stack([noisy_stft.real, noisy_stft.imag], dim=1)
+
+            encoded = encoder(stft_input).mean(dim=2)
             target_time = max(target_time, encoded.shape[-1])
             fused_features.append(encoded)
 
@@ -1111,13 +1227,31 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         ]
         stft_feat = torch.cat(aligned_features, dim=1)
         wave_delta = self.continuous_stft_residual_predictor(stft_feat)
-        wave_delta = F.interpolate(wave_delta, size=base_wave.shape[-1], mode="linear", align_corners=False)
+
+        if self.continuous_stft_low_head is not None and self.continuous_stft_high_head is not None and self.continuous_stft_fusion_gate is not None:
+            stride = max(2, int(self.continuous_residual_stft_low_stride))
+            low_feat = F.avg_pool1d(wave_delta, kernel_size=stride, stride=stride, ceil_mode=True)
+            low_delta = self.continuous_stft_low_head(low_feat)
+            low_delta = F.interpolate(low_delta, size=wave_delta.shape[-1], mode="linear", align_corners=False)
+
+            high_delta = self.continuous_stft_high_head(wave_delta)
+            gate = torch.sigmoid(self.continuous_stft_fusion_gate(wave_delta))
+            wave_delta = wave_delta + gate * low_delta + (1.0 - gate) * high_delta
+
+        branch_wave = F.interpolate(wave_delta, size=min_len, mode="linear", align_corners=False)
         if self.continuous_residual_zero_mean:
-            wave_delta = wave_delta - wave_delta.mean(dim=-1, keepdim=True)
+            branch_wave = branch_wave - branch_wave.mean(dim=-1, keepdim=True)
         if self.continuous_residual_probe_scale != 1.0:
-            wave_delta = wave_delta * float(self.continuous_residual_probe_scale)
-        enhanced_wave = base_wave + wave_delta
-        return enhanced_wave, wave_delta
+            branch_wave = branch_wave * float(self.continuous_residual_probe_scale)
+
+        if self.continuous_residual_direct_clean_target:
+            enhanced_wave = branch_wave
+            wave_delta_out = enhanced_wave - base_wave[..., :min_len]
+        else:
+            enhanced_wave = base_wave[..., :min_len] + branch_wave
+            wave_delta_out = branch_wave
+
+        return enhanced_wave, wave_delta_out
 
     def _apply_trainable_param_patterns(self, patterns: Iterable[str]) -> None:
         normalized = [p for p in patterns if isinstance(p, str) and p.strip()]
@@ -1400,6 +1534,16 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 total_loss = total_loss + self.sad_rvq_scheme_d_continuous_front3_ce_weight * front_ce
                 self.log(f"{stage}/cont_front3_ce", front_ce, prog_bar=True, sync_dist=True)
 
+            if self.sad_rvq_scheme_d_continuous_full_ce_weight > 0 and not (in_warmup and self.continuous_residual_warmup_residual_only):
+                full_ce_per_token = F.cross_entropy(
+                    logits_for_ce.reshape(-1, V),
+                    y_tok.reshape(-1),
+                    reduction="none",
+                ).reshape(B, K, L)
+                full_ce = (full_ce_per_token * mask).sum() / (mask.sum() + 1e-8)
+                total_loss = total_loss + self.sad_rvq_scheme_d_continuous_full_ce_weight * full_ce
+                self.log(f"{stage}/cont_full_ce", full_ce, prog_bar=True, sync_dist=True)
+
             self.log(f"{stage}/cont_loss_coarse", loss_coarse, prog_bar=True, sync_dist=True)
             self.log(f"{stage}/cont_loss_enhanced", loss_enhanced, prog_bar=True, sync_dist=True)
             self.log(f"{stage}/cont_loss_noisy", noisy_si_sdr_loss, prog_bar=True, sync_dist=True)
@@ -1407,8 +1551,12 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
             if in_warmup and wave_delta is not None:
                 wave_delta = wave_delta[..., :min_len]
-                warmup_target = (y_target - coarse_wave).detach()
-                warmup_l1 = F.l1_loss(wave_delta, warmup_target)
+                if self.continuous_residual_direct_clean_target:
+                    warmup_target = y_target.detach()
+                    warmup_l1 = F.l1_loss(enhanced_wave, warmup_target)
+                else:
+                    warmup_target = (y_target - coarse_wave).detach()
+                    warmup_l1 = F.l1_loss(wave_delta, warmup_target)
                 warmup_total = self.continuous_residual_warmup_weight * warmup_l1
                 self.log(f"{stage}/cont_warmup_res_l1", warmup_l1, prog_bar=True, sync_dist=True)
 
@@ -1433,20 +1581,38 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
             if wave_delta is not None:
                 wave_delta = wave_delta[..., :min_len]
-                wave_residual_target = (y_target - coarse_wave).detach()
                 self.log(f"{stage}/cont_res_abs_mean", wave_delta.abs().mean(), prog_bar=True, sync_dist=True)
 
-                if self.residual_l1_weight > 0:
-                    res_loss = F.l1_loss(wave_delta, wave_residual_target)
-                    total_loss = total_loss + self.residual_l1_weight * res_loss
-                    self.log(f"{stage}/cont_res_l1", res_loss, prog_bar=False, sync_dist=True)
+                if not self.continuous_residual_direct_clean_target:
+                    wave_residual_target = (y_target - coarse_wave).detach()
 
-                if self.residual_cos_weight > 0:
-                    res_cos = 1.0 - F.cosine_similarity(
-                        wave_delta.flatten(1), wave_residual_target.flatten(1), dim=1
-                    ).mean()
-                    total_loss = total_loss + self.residual_cos_weight * res_cos
-                    self.log(f"{stage}/cont_res_cos", res_cos, prog_bar=False, sync_dist=True)
+                    if self.residual_l1_weight > 0:
+                        res_loss = F.l1_loss(wave_delta, wave_residual_target)
+                        total_loss = total_loss + self.residual_l1_weight * res_loss
+                        self.log(f"{stage}/cont_res_l1", res_loss, prog_bar=False, sync_dist=True)
+
+                    if self.residual_cos_weight > 0:
+                        res_cos = 1.0 - F.cosine_similarity(
+                            wave_delta.flatten(1), wave_residual_target.flatten(1), dim=1
+                        ).mean()
+                        total_loss = total_loss + self.residual_cos_weight * res_cos
+                        self.log(f"{stage}/cont_res_cos", res_cos, prog_bar=False, sync_dist=True)
+
+            if self.continuous_branch_wave_l1_weight > 0:
+                if self.continuous_residual_direct_clean_target:
+                    branch_pred = enhanced_wave
+                    branch_target = y_target
+                else:
+                    branch_pred = wave_delta if wave_delta is not None else (enhanced_wave - coarse_wave)
+                    branch_target = (y_target - coarse_wave).detach()
+                branch_l1 = F.l1_loss(branch_pred, branch_target)
+                total_loss = total_loss + self.continuous_branch_wave_l1_weight * branch_l1
+                self.log(f"{stage}/cont_branch_l1", branch_l1, prog_bar=True, sync_dist=True)
+
+            if self.continuous_branch_si_sdr_weight > 0 and self.continuous_residual_direct_clean_target:
+                branch_si_sdr = self._si_sdr_loss(enhanced_wave, y_target)
+                total_loss = total_loss + self.continuous_branch_si_sdr_weight * branch_si_sdr
+                self.log(f"{stage}/cont_branch_si_sdr", branch_si_sdr, prog_bar=True, sync_dist=True)
 
             if self.wave_l1_weight > 0:
                 wave_l1 = F.l1_loss(enhanced_wave, y_target)

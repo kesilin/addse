@@ -31,6 +31,7 @@ if __name__ == "__main__":
     parser.add_argument("--eval-steps", type=int, default=200, help="Diffusion steps during eval; use 200 for strict evaluation")
     parser.add_argument("--val-every", type=int, default=1)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--train-num-workers", type=int, default=8, help="Number of train dataloader workers")
     parser.add_argument("--reset-log-dir", action="store_true", help="Delete log dir before training")
     parser.add_argument("--reset-db", action="store_true", help="Delete output DB before evaluation")
     parser.add_argument("--deterministic-eval", action="store_true", help="Use deterministic token decoding during eval")
@@ -57,6 +58,12 @@ if __name__ == "__main__":
     parser.add_argument("--continuous-residual-use-multiscale-stft", action="store_true", help="Use multiscale STFT features in the residual branch")
     parser.add_argument("--continuous-residual-predictor-channels", type=int, default=256, help="Hidden channels for the residual predictor")
     parser.add_argument("--continuous-residual-predictor-blocks", type=int, default=3, help="Number of temporal residual blocks in the predictor")
+    parser.add_argument("--continuous-residual-predictor-dilation-rates", type=str, default="1,2,4,8", help="Comma-separated dilation rates for the atrous pyramid in the predictor")
+    parser.add_argument("--continuous-residual-stft-low-stride", type=int, default=8, help="Pooling stride for the low-frequency refinement head")
+    parser.add_argument("--continuous-residual-stft-input-mode", type=str, default="noisy", choices=["noisy", "noisy_base_residual"], help="Input feature mode for STFT residual branch")
+    parser.add_argument("--continuous-residual-direct-clean-target", action="store_true", help="Let STFT branch directly predict clean waveform instead of residual")
+    parser.add_argument("--continuous-branch-wave-l1-weight", type=float, default=0.0, help="Independent L1 supervision weight for branch output")
+    parser.add_argument("--continuous-branch-si-sdr-weight", type=float, default=0.0, help="Independent SI-SDR supervision weight for branch output (direct clean mode)")
     parser.add_argument("--continuous-residual-multiscale-nffts", type=str, default="512,1024,2048", help="Comma-separated FFT sizes for multiscale STFT")
     parser.add_argument("--continuous-residual-multiscale-hops", type=str, default="128,256,512", help="Comma-separated hop sizes for multiscale STFT")
     parser.add_argument("--continuous-residual-multiscale-wins", type=str, default="512,1024,2048", help="Comma-separated window sizes for multiscale STFT")
@@ -131,6 +138,8 @@ if __name__ == "__main__":
                        help="Weight for enhanced-wave SI-SDR loss in continuous residual mode")
     parser.add_argument("--sad-rvq-scheme-d-continuous-front3-ce-weight", type=float, default=1.0,
                        help="Auxiliary CE weight for first 3 codebooks in continuous residual mode")
+    parser.add_argument("--sad-rvq-scheme-d-continuous-full-ce-weight", type=float, default=0.0,
+                       help="Full discrete CE weight in continuous residual mode (for serial+parallel joint optimization)")
     parser.add_argument("--sad-rvq-scheme-d-continuous-coarse-source", type=str, default="front3", choices=["front3", "noisy"],
                        help="Coarse waveform source in continuous residual mode")
     parser.add_argument("--sad-rvq-scheme-d-continuous-dump-audio", action="store_true",
@@ -166,6 +175,7 @@ if __name__ == "__main__":
     multiscale_nffts = [int(x) for x in args.continuous_residual_multiscale_nffts.split(",") if x.strip()]
     multiscale_hops = [int(x) for x in args.continuous_residual_multiscale_hops.split(",") if x.strip()]
     multiscale_wins = [int(x) for x in args.continuous_residual_multiscale_wins.split(",") if x.strip()]
+    predictor_dilation_rates = [int(x) for x in args.continuous_residual_predictor_dilation_rates.split(",") if x.strip()]
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -239,12 +249,18 @@ if __name__ == "__main__":
             f"++lm.continuous_residual_use_multiscale_stft={str(args.continuous_residual_use_multiscale_stft).lower()}",
             f"++lm.continuous_residual_predictor_channels={args.continuous_residual_predictor_channels}",
             f"++lm.continuous_residual_predictor_blocks={args.continuous_residual_predictor_blocks}",
+            f"++lm.continuous_residual_predictor_dilation_rates={predictor_dilation_rates}",
+            f"++lm.continuous_residual_stft_low_stride={args.continuous_residual_stft_low_stride}",
+            f"++lm.continuous_residual_stft_input_mode={args.continuous_residual_stft_input_mode}",
+            f"++lm.continuous_residual_direct_clean_target={str(args.continuous_residual_direct_clean_target).lower()}",
+            f"++lm.continuous_branch_wave_l1_weight={args.continuous_branch_wave_l1_weight}",
+            f"++lm.continuous_branch_si_sdr_weight={args.continuous_branch_si_sdr_weight}",
             f"++lm.continuous_residual_multiscale_nffts={multiscale_nffts}",
             f"++lm.continuous_residual_multiscale_hops={multiscale_hops}",
             f"++lm.continuous_residual_multiscale_wins={multiscale_wins}",
 
             # ==== 2. 硬件加速（榨干性能，帮你省时间） ====
-            "++dm.train_dataloader.num_workers=8",   # 开启多线程读数据，别让 GPU 等 CPU
+            f"++dm.train_dataloader.num_workers={args.train_num_workers}",   # 开启多线程读数据，别让 GPU 等 CPU
             "++dm.train_dataloader.pin_memory=true", # 内存锁页，加速传输
 
             # ==== 3. 验证与杂项配置 ====
@@ -283,6 +299,7 @@ if __name__ == "__main__":
             f"++lm.sad_rvq_scheme_d_continuous_coarse_weight={args.sad_rvq_scheme_d_continuous_coarse_weight}",
             f"++lm.sad_rvq_scheme_d_continuous_enhanced_weight={args.sad_rvq_scheme_d_continuous_enhanced_weight}",
             f"++lm.sad_rvq_scheme_d_continuous_front3_ce_weight={args.sad_rvq_scheme_d_continuous_front3_ce_weight}",
+            f"++lm.sad_rvq_scheme_d_continuous_full_ce_weight={args.sad_rvq_scheme_d_continuous_full_ce_weight}",
             f"++lm.sad_rvq_scheme_d_continuous_coarse_source={args.sad_rvq_scheme_d_continuous_coarse_source}",
             f"++lm.sad_rvq_scheme_d_continuous_dump_audio={str(args.sad_rvq_scheme_d_continuous_dump_audio).lower()}",
             f"++lm.sad_rvq_scheme_d_continuous_use_stft_predictor={str(args.sad_rvq_scheme_d_continuous_use_stft_predictor).lower()}",
@@ -351,6 +368,11 @@ if __name__ == "__main__":
                 f"++lm.continuous_residual_use_multiscale_stft={str(args.continuous_residual_use_multiscale_stft).lower()}",
                 f"++lm.continuous_residual_predictor_channels={args.continuous_residual_predictor_channels}",
                 f"++lm.continuous_residual_predictor_blocks={args.continuous_residual_predictor_blocks}",
+                f"++lm.continuous_residual_stft_low_stride={args.continuous_residual_stft_low_stride}",
+                f"++lm.continuous_residual_stft_input_mode={args.continuous_residual_stft_input_mode}",
+                f"++lm.continuous_residual_direct_clean_target={str(args.continuous_residual_direct_clean_target).lower()}",
+                f"++lm.continuous_branch_wave_l1_weight={args.continuous_branch_wave_l1_weight}",
+                f"++lm.continuous_branch_si_sdr_weight={args.continuous_branch_si_sdr_weight}",
                 f"++lm.continuous_residual_multiscale_nffts={multiscale_nffts}",
                 f"++lm.continuous_residual_multiscale_hops={multiscale_hops}",
                 f"++lm.continuous_residual_multiscale_wins={multiscale_wins}",
@@ -384,6 +406,7 @@ if __name__ == "__main__":
                 f"++lm.sad_rvq_scheme_d_continuous_coarse_weight={args.sad_rvq_scheme_d_continuous_coarse_weight}",
                 f"++lm.sad_rvq_scheme_d_continuous_enhanced_weight={args.sad_rvq_scheme_d_continuous_enhanced_weight}",
                 f"++lm.sad_rvq_scheme_d_continuous_front3_ce_weight={args.sad_rvq_scheme_d_continuous_front3_ce_weight}",
+                f"++lm.sad_rvq_scheme_d_continuous_full_ce_weight={args.sad_rvq_scheme_d_continuous_full_ce_weight}",
                 f"++lm.sad_rvq_scheme_d_continuous_coarse_source={args.sad_rvq_scheme_d_continuous_coarse_source}",
                 f"++lm.sad_rvq_scheme_d_continuous_dump_audio={str(args.sad_rvq_scheme_d_continuous_dump_audio).lower()}",
                 f"++lm.sad_rvq_scheme_d_continuous_use_stft_predictor={str(args.sad_rvq_scheme_d_continuous_use_stft_predictor).lower()}",
