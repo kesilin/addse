@@ -18,6 +18,7 @@ from addse.app.eval import eval as eval_func
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("run_v33 short/full pipeline")
+    parser.add_argument("--config", type=str, default="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml", help="Hydra config file path")
     parser.add_argument("--train-epochs", type=int, default=10)
     parser.add_argument("--train-batches", type=int, default=5)
     parser.add_argument("--total-steps", type=int, default=0, help="If >0, override to single-epoch training with this many batches")
@@ -78,6 +79,10 @@ if __name__ == "__main__":
     parser.add_argument("--print-alpha", action="store_true", help="Print alpha logs in progress bar (handled in lightning logs)")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducible runs")
     parser.add_argument("--disable-pretrained-ckpt", action="store_true", help="Disable lm.pretrained_ckpt loading to avoid mismatch interference")
+    parser.add_argument("--pretrained-ckpt", type=str, default=None, help="Override lm.pretrained_ckpt; empty string disables preload")
+    parser.add_argument("--trainable-param-patterns", type=str, default=None, help="Comma-separated lm.trainable_param_patterns; empty string clears it")
+    parser.add_argument("--audit-pretrained-load", action="store_true", help="Print pretrained missing/unexpected key audit")
+    parser.add_argument("--discrete-audit-log-interval", type=int, default=20, help="Print interval for force-discrete CE/accuracy audit")
     parser.add_argument("--eval-ckpt-policy", type=str, default="best", choices=["best", "last"], help="Checkpoint policy for evaluation")
     parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate with --checkpoint-path")
     parser.add_argument("--checkpoint-path", type=str, default="", help="Checkpoint path used when --eval-only is enabled")
@@ -85,6 +90,7 @@ if __name__ == "__main__":
     parser.add_argument("--late-fusion-cont-weight", type=float, default=1.0, help="Late-fusion weight applied to continuous residual branch")
     parser.add_argument("--continuous-residual-discrete-prior-weight", type=float, default=0.3, help="Weight of discrete coarse prior injected into continuous branch input")
     parser.add_argument("--continuous-residual-explicit-l1-weight", type=float, default=0.5, help="Explicit residual L1 supervision weight in continuous enhanced loss")
+    parser.add_argument("--discrete-branch-lr-scale", type=float, default=1.0, help="LR scale applied to discrete trunk params under force_discrete_only")
 
     # ===== SAD-RVQ Scheme Selection =====
     parser.add_argument("--sad-rvq-scheme", type=str, default="baseline", choices=["baseline", "a", "b", "c", "d", "e", "f", "g", "h"],
@@ -221,8 +227,22 @@ if __name__ == "__main__":
 
     disable_logits_interaction = bool(args.disable_logits_interaction and not args.enable_logits_interaction)
     print(f"--- logits交互状态: {str((not disable_logits_interaction)).lower()} ---")
+    trainable_patterns_override = "++lm.trainable_param_patterns=[]" if args.force_discrete_only else None
 
     pretrained_ckpt_override = "++lm.pretrained_ckpt=null" if args.disable_pretrained_ckpt else None
+    if args.pretrained_ckpt is not None:
+        if args.pretrained_ckpt.strip() == "":
+            pretrained_ckpt_override = "++lm.pretrained_ckpt=null"
+        else:
+            pretrained_ckpt_override = f"++lm.pretrained_ckpt={args.pretrained_ckpt.strip()}"
+
+    if args.trainable_param_patterns is not None:
+        if args.trainable_param_patterns.strip() == "":
+            trainable_patterns_override = "++lm.trainable_param_patterns=[]"
+        else:
+            patterns = [p.strip() for p in args.trainable_param_patterns.split(",") if p.strip()]
+            trainable_patterns_override = f"++lm.trainable_param_patterns={patterns}"
+
     multiscale_nffts = [int(x) for x in args.continuous_residual_multiscale_nffts.split(",") if x.strip()]
     multiscale_hops = [int(x) for x in args.continuous_residual_multiscale_hops.split(",") if x.strip()]
     multiscale_wins = [int(x) for x in args.continuous_residual_multiscale_wins.split(",") if x.strip()]
@@ -259,7 +279,7 @@ if __name__ == "__main__":
 
     if not args.eval_only:
         train_func(
-            config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
+            config_file=args.config,
             overrides=[
             # ==== 1. 训练轮次与数据量精准控制 ====
             f"++trainer.max_epochs={args.train_epochs}",
@@ -301,9 +321,13 @@ if __name__ == "__main__":
             f"++lm.continuous_gain_margin={args.continuous_gain_margin}",
             f"++lm.continuous_gain_penalty_weight={args.continuous_gain_penalty_weight}",
             f"++lm.force_discrete_only={str(args.force_discrete_only).lower()}",
+            f"++lm.audit_pretrained_load={str(args.audit_pretrained_load).lower()}",
+            f"++lm.discrete_audit_log_interval={int(args.discrete_audit_log_interval)}",
+            f"++lm.discrete_branch_lr_scale={args.discrete_branch_lr_scale}",
             f"++lm.late_fusion_cont_weight={args.late_fusion_cont_weight}",
             f"++lm.continuous_residual_discrete_prior_weight={args.continuous_residual_discrete_prior_weight}",
             f"++lm.continuous_residual_explicit_l1_weight={args.continuous_residual_explicit_l1_weight}",
+            *([trainable_patterns_override] if trainable_patterns_override is not None else []),
             f"++lm.continuous_residual_use_multiscale_stft={str(args.continuous_residual_use_multiscale_stft).lower()}",
             f"++lm.continuous_residual_predictor_channels={args.continuous_residual_predictor_channels}",
             f"++lm.continuous_residual_predictor_blocks={args.continuous_residual_predictor_blocks}",
@@ -422,7 +446,7 @@ if __name__ == "__main__":
 
     print(f"--- 正在使用权重进行评估: {selected_ckpt} ---")
     eval_func(
-            config_file="configs/addse-s-edbase-parallel60-a008-p02-spec.yaml",
+            config_file=args.config,
             checkpoint=selected_ckpt,
             overrides=[
                 f"lm.num_steps={args.eval_steps}",
@@ -431,9 +455,13 @@ if __name__ == "__main__":
                 f"++eval_min_duration={args.eval_min_duration}",
                 f"lm.deterministic_eval={str(args.deterministic_eval).lower()}",
                 f"++lm.force_discrete_only={str(args.force_discrete_only).lower()}",
+                f"++lm.audit_pretrained_load={str(args.audit_pretrained_load).lower()}",
+                f"++lm.discrete_audit_log_interval={int(args.discrete_audit_log_interval)}",
+                f"++lm.discrete_branch_lr_scale={args.discrete_branch_lr_scale}",
                 f"++lm.late_fusion_cont_weight={args.late_fusion_cont_weight}",
                 f"++lm.continuous_residual_discrete_prior_weight={args.continuous_residual_discrete_prior_weight}",
                 f"++lm.continuous_residual_explicit_l1_weight={args.continuous_residual_explicit_l1_weight}",
+                *([trainable_patterns_override] if trainable_patterns_override is not None else []),
                 f"++lm.continuous_residual_train_only={str(args.continuous_residual_train_only).lower()}",
                 f"++lm.continuous_residual_joint_train={str(args.continuous_residual_joint_train).lower()}",
                 f"++lm.continuous_residual_lr_scale={args.continuous_residual_lr_scale}",

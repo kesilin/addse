@@ -433,6 +433,9 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         self.continuous_gain_margin = float(kwargs.get("continuous_gain_margin", 0.0))
         self.continuous_gain_penalty_weight = float(kwargs.get("continuous_gain_penalty_weight", 0.0))
         self.force_discrete_only = bool(kwargs.get("force_discrete_only", False))
+        self.audit_pretrained_load = bool(kwargs.get("audit_pretrained_load", False))
+        self.discrete_audit_log_interval = int(kwargs.get("discrete_audit_log_interval", 20))
+        self.discrete_branch_lr_scale = float(kwargs.get("discrete_branch_lr_scale", 1.0))
         self.continuous_residual_discrete_prior_weight = float(
             kwargs.get("continuous_residual_discrete_prior_weight", 0.3)
         )
@@ -647,9 +650,41 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
             state_dict = ckpt_data.get("state_dict", ckpt_data)
             missing, unexpected = self.load_state_dict(state_dict, strict=False)
             print(f"--- 预加载完成 (missing={len(missing)}, unexpected={len(unexpected)}) ---")
+            if self.audit_pretrained_load:
+                model_missing = [k for k in missing if k.startswith("model.")]
+                parallel_keywords = (
+                    "refiner",
+                    "interaction",
+                    "freq_gate",
+                    "pitch_gate",
+                    "quality_head",
+                    "snr_gate_proj",
+                    "parallel_proj",
+                    "wave_residual",
+                    "continuous_stft",
+                )
+                parallel_missing = [k for k in model_missing if any(token in k for token in parallel_keywords)]
+                trunk_missing = [k for k in model_missing if k not in parallel_missing]
+                print("===== 预训练权重缺失层审计 =====")
+                print(f"总缺失层数量: {len(missing)}")
+                print(f"model.* 缺失层数量: {len(model_missing)}")
+                print(f"并联/连续相关缺失层数量: {len(parallel_missing)}")
+                print(f"离散主干相关缺失层数量: {len(trunk_missing)}")
+                preview_n = 60
+                if trunk_missing:
+                    print("--- 离散主干缺失层样例 ---")
+                    for key in trunk_missing[:preview_n]:
+                        print(f"缺失层: {key}")
+                if unexpected:
+                    print("--- 预训练多余层样例 ---")
+                    for key in unexpected[:preview_n]:
+                        print(f"多余层: {key}")
 
         if self.sad_rvq_scheme_d_train_post3_only:
             self._scheme_d_apply_post3_train_only()
+
+        if self.force_discrete_only:
+            self._apply_force_discrete_only_requires_grad()
 
         if self.continuous_residual_train_only:
             self._apply_continuous_residual_train_only_requires_grad()
@@ -677,6 +712,29 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
     def _is_continuous_residual_backbone_param(self, name: str) -> bool:
         return name.startswith("model.")
+
+    def _is_parallel_continuous_param(self, name: str) -> bool:
+        parallel_keys = (
+            "model.refiner",
+            "model.interaction_alpha",
+            "model.interaction_proj",
+            "model.parallel_proj",
+            "model.freq_gate",
+            "model.pitch_gate",
+            "model.snr_gate_proj",
+            "model.quality_head",
+            "model.alpha_proj",
+            "continuous_stft_",
+            "wave_residual_",
+        )
+        return any(key in name for key in parallel_keys)
+
+    def _apply_force_discrete_only_requires_grad(self) -> None:
+        for name, param in self.named_parameters():
+            if name.startswith("model."):
+                param.requires_grad = not self._is_parallel_continuous_param(name)
+            elif self._is_parallel_continuous_param(name):
+                param.requires_grad = False
 
     def _apply_continuous_residual_joint_train_requires_grad(self) -> None:
         for name, param in self.named_parameters():
@@ -736,14 +794,20 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
                 module.train()
 
     def on_train_start(self) -> None:
+        if self.force_discrete_only:
+            self._apply_force_discrete_only_requires_grad()
         self._apply_continuous_stage_requires_grad()
         self._apply_continuous_residual_train_mode()
 
     def on_train_epoch_start(self) -> None:
+        if self.force_discrete_only:
+            self._apply_force_discrete_only_requires_grad()
         self._apply_continuous_stage_requires_grad()
         self._apply_continuous_residual_train_mode()
 
     def on_train_batch_start(self, batch: Any, batch_idx: int) -> None:
+        if self.force_discrete_only:
+            self._apply_force_discrete_only_requires_grad()
         self._apply_continuous_stage_requires_grad()
 
     def on_after_backward(self) -> None:
@@ -783,6 +847,36 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         return self
 
     def configure_optimizers(self) -> Any:
+        if self.force_discrete_only:
+            base_lr = self._get_base_optimizer_lr()
+            branch_scale = max(float(self.discrete_branch_lr_scale), 1e-8)
+            discrete_params: list[nn.Parameter] = []
+            other_params: list[nn.Parameter] = []
+            for name, p in self.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if name.startswith("model.") and not self._is_parallel_continuous_param(name):
+                    discrete_params.append(p)
+                else:
+                    other_params.append(p)
+
+            if len(discrete_params) == 0:
+                raise ValueError("force_discrete_only is enabled, but no discrete trunk parameters are trainable")
+
+            param_groups: list[dict[str, Any]] = [
+                {"params": discrete_params, "lr": base_lr * branch_scale}
+            ]
+            if other_params:
+                param_groups.append({"params": other_params, "lr": base_lr})
+
+            optimizer = self.optimizer(param_groups)
+            output: dict[str, Any] = {"optimizer": optimizer}
+            if self.lr_scheduler is not None:
+                output["lr_scheduler"] = {
+                    k: v(optimizer) if k == "scheduler" else v for k, v in self.lr_scheduler.items()
+                }
+            return output
+
         if self.continuous_residual_train_only:
             trainable_params = [
                 p
@@ -1835,6 +1929,32 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
         ce_loss = (ce_per_token * mask).sum() / (mask.sum() + 1e-8)
         total_loss = ce_loss
         self.log(f"{stage}/ce_loss", ce_loss, prog_bar=True, sync_dist=True)
+        pred_tok = logits_for_ce.argmax(dim=-1)
+        token_acc = ((pred_tok == y_tok).float() * mask.float()).sum() / (mask.sum() + 1e-8)
+        self.log(f"{stage}/discrete_token_acc", token_acc, prog_bar=True, sync_dist=True)
+        if self.force_discrete_only and stage == "train":
+            interval = max(1, int(self.discrete_audit_log_interval))
+            if int(getattr(self, "global_step", 0)) % interval == 0:
+                token_overlap = (x_tok == y_tok).float().mean()
+                mask_ratio = mask.float().mean()
+                probs = F.softmax(logits_for_ce.detach(), dim=-1)
+                token_entropy = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1).mean()
+                target_hist = torch.bincount(y_tok.reshape(-1), minlength=V)
+                noisy_hist = torch.bincount(x_tok.reshape(-1), minlength=V)
+                tgt_top = torch.topk(target_hist, k=min(10, V)).indices.detach().cpu().tolist()
+                noisy_top = torch.topk(noisy_hist, k=min(10, V)).indices.detach().cpu().tolist()
+                print(
+                    f"Step {int(getattr(self, 'global_step', 0))} | 纯离散损失: CE={ce_loss.detach().item():.4f} | 总损失={total_loss.detach().item():.4f}"
+                )
+                print(
+                    f"Step {int(getattr(self, 'global_step', 0))} | 离散主干分类准确率: {token_acc.detach().item():.4f}"
+                )
+                print(
+                    f"Step {int(getattr(self, 'global_step', 0))} | token重合率(noisy-clean): {token_overlap.detach().item():.4f} | mask比例: {mask_ratio.detach().item():.4f} | token熵: {token_entropy.detach().item():.4f}"
+                )
+                print(
+                    f"Step {int(getattr(self, 'global_step', 0))} | noisy token top10: {noisy_top} | clean token top10: {tgt_top}"
+                )
         if K > 3:
             mask_4plus = mask[:, 3:, :]
             ce_4plus = (ce_per_token[:, 3:, :] * mask_4plus).sum() / (mask_4plus.sum() + 1e-8)
@@ -2015,7 +2135,7 @@ class ADDSELightningModule(BaseLightningModule, ConfigureOptimizersMixin):
 
         y_q_sum = self._sum_quantized_latent(y_q, K)
 
-        if self.wave_residual_enabled:
+        if self.wave_residual_enabled and not self.force_discrete_only:
             base_wave = self._decode_latent_to_wave(y_q_sum.detach(), target_length=y.shape[-1])
             y_pred, wave_delta = self._predict_wave_residual(x, base_wave, residual_pred)
             
