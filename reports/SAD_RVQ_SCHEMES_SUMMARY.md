@@ -109,7 +109,7 @@ Router 学习:   gate [B, K, L, 1] ∈ [0, 1]
 4. **`addse/probe_architecture_surgery.py`** - 扩展了 4 个新的诊断 probe
 
 ### 文档
-1. **`addse/SAD_RVQ_4_SCHEMES_GUIDE.md`** - 完整集成指南与时间表
+1. **`reports/SAD_RVQ_4_SCHEMES_GUIDE.md`** - 完整集成指南与时间表
 2. **`addse/probe_outputs/sad_rvq_advanced_diagnosis.txt`** - 诊断实验结果报告
 
 ---
@@ -206,7 +206,7 @@ python addse/run_schemes_comparison.py --quick  # 只跑 baseline + A，2 epoch
 ## 📚 参考资源
 
 - [Oracle Ceiling Results](addse/probe_outputs/sad_rvq_advanced_diagnosis.txt)
-- [Architecture Surgery Guide](addse/SAD_RVQ_4_SCHEMES_GUIDE.md)
+- [Architecture Surgery Guide](SAD_RVQ_4_SCHEMES_GUIDE.md)
 - [Scheme Modules](addse/run_sad_rvq_schemes.py)
 - [Integration Guide](addse/addse/lightning.py) - 搜索 `sad_rvq_scheme`
 

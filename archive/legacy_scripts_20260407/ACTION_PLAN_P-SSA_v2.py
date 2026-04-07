@@ -319,5 +319,5 @@ if __name__ == "__main__":
     print(TIMELINE)
     print("\n")
     print("=" * 80)
-    print("详见: ANALYSIS_P-SSA_v2_INNOVATION_MATRIX.md (完整分析)")
+    print("详见: reports/ANALYSIS_P-SSA_v2_INNOVATION_MATRIX.md (完整分析)")
     print("=" * 80)
